@@ -1,0 +1,97 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1120" height="640" viewBox="0 0 1120 640" role="img" aria-label="Stitching pipeline: frame sources feed a web worker that prepares each frame, estimates motion, aligns it to the map, learns the HUD, corrects lighting and composites into a tiled mosaic, which the UI thread displays and exports.">
+<defs><marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#8c959f"/></marker><marker id="a-cf222e" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#cf222e"/></marker><marker id="a-8250df" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#8250df"/></marker></defs>
+<style>text { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; }</style>
+<rect width="1120" height="640" rx="12" fill="#ffffff"/>
+<text x="40" y="46" font-size="12" font-weight="700" fill="#59636e" text-anchor="start">FRAME SOURCES</text>
+<text x="330" y="46" font-size="12" font-weight="700" fill="#59636e" text-anchor="start">WEB WORKER</text>
+<text x="428" y="46" font-size="12" font-weight="400" fill="#59636e" text-anchor="start">Stitcher.process(frame)</text>
+<text x="914" y="46" font-size="12" font-weight="700" fill="#59636e" text-anchor="start">UI THREAD (REACT)</text>
+<rect x="40" y="70" width="240" height="72" rx="8" fill="#ffffff" stroke="#d0d7de"/>
+<path d="M48 70 h-0 a8 8 0 0 0 -8 8 v56 a8 8 0 0 0 8 8 h4 v-72 z" fill="#d4a72c"/>
+<text x="62" y="99" font-size="15" font-weight="600" fill="#1f2328" text-anchor="start">Share game window</text>
+<text x="62" y="118" font-size="13" font-weight="400" fill="#59636e" text-anchor="start">live, desktop Chrome / Edge</text>
+<rect x="40" y="162" width="240" height="72" rx="8" fill="#ffffff" stroke="#d0d7de"/>
+<path d="M48 162 h-0 a8 8 0 0 0 -8 8 v56 a8 8 0 0 0 8 8 h4 v-72 z" fill="#0969da"/>
+<text x="62" y="191" font-size="15" font-weight="600" fill="#1f2328" text-anchor="start">Open recording</text>
+<text x="62" y="210" font-size="13" font-weight="400" fill="#59636e" text-anchor="start">frame by frame, works on phones</text>
+<rect x="40" y="254" width="240" height="72" rx="8" fill="#ffffff" stroke="#d0d7de"/>
+<path d="M48 254 h-0 a8 8 0 0 0 -8 8 v56 a8 8 0 0 0 8 8 h4 v-72 z" fill="#1a7f37"/>
+<text x="62" y="283" font-size="15" font-weight="600" fill="#1f2328" text-anchor="start">Demo</text>
+<text x="62" y="302" font-size="13" font-weight="400" fill="#59636e" text-anchor="start">real AIC map, fake HUD on top</text>
+<rect x="316" y="60" width="556" height="560" rx="12" fill="#f6f8fa" stroke="#d0d7de"/>
+<rect x="340" y="84" width="290" height="64" rx="8" fill="#ffffff" stroke="#d0d7de"/>
+<circle cx="366" cy="116" r="13" fill="#1f2328"/>
+<text x="366" y="121" font-size="13" font-weight="700" fill="#ffffff" text-anchor="middle">1</text>
+<text x="390" y="111" font-size="15" font-weight="600" fill="#1f2328" text-anchor="start">Prepare</text>
+<text x="390" y="130" font-size="13" font-weight="400" fill="#59636e" text-anchor="start">luma + downscaled copies</text>
+<path d="M485 148 L485 171" fill="none" stroke="#8c959f" stroke-width="1.6" marker-end="url(#a)"/>
+<rect x="340" y="173" width="290" height="64" rx="8" fill="#ffffff" stroke="#d0d7de"/>
+<circle cx="366" cy="205" r="13" fill="#1f2328"/>
+<text x="366" y="210" font-size="13" font-weight="700" fill="#ffffff" text-anchor="middle">2</text>
+<text x="390" y="200" font-size="15" font-weight="600" fill="#1f2328" text-anchor="start">Coarse motion</text>
+<text x="390" y="219" font-size="13" font-weight="400" fill="#59636e" text-anchor="start">phase correlation (FFT)</text>
+<path d="M485 237 L485 260" fill="none" stroke="#8c959f" stroke-width="1.6" marker-end="url(#a)"/>
+<rect x="340" y="262" width="290" height="64" rx="8" fill="#ffffff" stroke="#d0d7de"/>
+<circle cx="366" cy="294" r="13" fill="#1f2328"/>
+<text x="366" y="299" font-size="13" font-weight="700" fill="#ffffff" text-anchor="middle">3</text>
+<text x="390" y="289" font-size="15" font-weight="600" fill="#1f2328" text-anchor="start">Fine alignment</text>
+<text x="390" y="308" font-size="13" font-weight="400" fill="#59636e" text-anchor="start">block ZNCC against the map</text>
+<path d="M485 326 L485 349" fill="none" stroke="#8c959f" stroke-width="1.6" marker-end="url(#a)"/>
+<rect x="340" y="351" width="290" height="64" rx="8" fill="#ffffff" stroke="#d0d7de"/>
+<circle cx="366" cy="383" r="13" fill="#1f2328"/>
+<text x="366" y="388" font-size="13" font-weight="700" fill="#ffffff" text-anchor="middle">4</text>
+<text x="390" y="378" font-size="15" font-weight="600" fill="#1f2328" text-anchor="start">Learn the HUD</text>
+<text x="390" y="397" font-size="13" font-weight="400" fill="#59636e" text-anchor="start">pixels that stay put while panning</text>
+<path d="M485 415 L485 438" fill="none" stroke="#8c959f" stroke-width="1.6" marker-end="url(#a)"/>
+<rect x="340" y="440" width="290" height="64" rx="8" fill="#ffffff" stroke="#d0d7de"/>
+<circle cx="366" cy="472" r="13" fill="#1f2328"/>
+<text x="366" y="477" font-size="13" font-weight="700" fill="#ffffff" text-anchor="middle">5</text>
+<text x="390" y="467" font-size="15" font-weight="600" fill="#1f2328" text-anchor="start">Fix lighting</text>
+<text x="390" y="486" font-size="13" font-weight="400" fill="#59636e" text-anchor="start">8×5 gain field matched to the map</text>
+<path d="M485 504 L485 527" fill="none" stroke="#8c959f" stroke-width="1.6" marker-end="url(#a)"/>
+<rect x="340" y="529" width="290" height="64" rx="8" fill="#ffffff" stroke="#d0d7de"/>
+<circle cx="366" cy="561" r="13" fill="#1f2328"/>
+<text x="366" y="566" font-size="13" font-weight="700" fill="#ffffff" text-anchor="middle">6</text>
+<text x="390" y="556" font-size="15" font-weight="600" fill="#1f2328" text-anchor="start">Composite</text>
+<text x="390" y="575" font-size="13" font-weight="400" fill="#59636e" text-anchor="start">whole blobs, seams avoid facilities</text>
+<path d="M280 106 H298" fill="none" stroke="#8c959f" stroke-width="1.6"/>
+<path d="M280 198 H298" fill="none" stroke="#8c959f" stroke-width="1.6"/>
+<path d="M280 290 H298" fill="none" stroke="#8c959f" stroke-width="1.6"/>
+<path d="M298 106 V290" fill="none" stroke="#8c959f" stroke-width="1.6"/>
+<path d="M298 116 L338 116" fill="none" stroke="#8c959f" stroke-width="1.6" marker-end="url(#a)"/>
+<rect x="686" y="262" width="172" height="64" rx="8" fill="#ffffff" stroke="#d0d7de"/>
+<path d="M694 262 h-0 a8 8 0 0 0 -8 8 v48 a8 8 0 0 0 8 8 h4 v-64 z" fill="#cf222e"/>
+<text x="708" y="278" font-size="15" font-weight="600" fill="#1f2328" text-anchor="start">Relocalize</text>
+<text x="708" y="297" font-size="13" font-weight="400" fill="#59636e" text-anchor="start">search the whole map</text>
+<text x="708" y="315" font-size="13" font-weight="400" fill="#59636e" text-anchor="start">after a jump</text>
+<path d="M630 284 L684 284" fill="none" stroke="#cf222e" stroke-width="1.6" marker-end="url(#a-cf222e)"/>
+<text x="638" y="277" font-size="12" font-weight="600" fill="#cf222e" text-anchor="start">lost?</text>
+<path d="M686 306 L632 306" fill="none" stroke="#8c959f" stroke-width="1.6" marker-end="url(#a)"/>
+<rect x="686" y="440" width="172" height="153" rx="8" fill="#ffffff" stroke="#d0d7de"/>
+<path d="M694 440 h-0 a8 8 0 0 0 -8 8 v137 a8 8 0 0 0 8 8 h4 v-153 z" fill="#8250df"/>
+<text x="708" y="491.5" font-size="15" font-weight="600" fill="#1f2328" text-anchor="start">Mosaic</text>
+<text x="708" y="510.5" font-size="13" font-weight="400" fill="#59636e" text-anchor="start">512 px tiles</text>
+<text x="708" y="528.5" font-size="13" font-weight="400" fill="#59636e" text-anchor="start">the reference for</text>
+<text x="708" y="546.5" font-size="13" font-weight="400" fill="#59636e" text-anchor="start">steps 3 and 5</text>
+<path d="M630 561 L684 561" fill="none" stroke="#8c959f" stroke-width="1.6" marker-end="url(#a)"/>
+<path d="M686 472 L632 472" fill="none" stroke="#8250df" stroke-width="1.6" stroke-dasharray="5 4" marker-end="url(#a-8250df)"/>
+<text x="634" y="464" font-size="12" font-weight="600" fill="#8250df" text-anchor="start">reference</text>
+<rect x="914" y="70" width="176" height="72" rx="8" fill="#ffffff" stroke="#d0d7de"/>
+<text x="930" y="90" font-size="15" font-weight="600" fill="#1f2328" text-anchor="start">Map viewer</text>
+<text x="930" y="109" font-size="13" font-weight="400" fill="#59636e" text-anchor="start">¼-res tiles,</text>
+<text x="930" y="127" font-size="13" font-weight="400" fill="#59636e" text-anchor="start">full-res when zoomed</text>
+<path d="M896 106 L912 106" fill="none" stroke="#8c959f" stroke-width="1.6" marker-end="url(#a)"/>
+<rect x="914" y="162" width="176" height="72" rx="8" fill="#ffffff" stroke="#d0d7de"/>
+<text x="930" y="182" font-size="15" font-weight="600" fill="#1f2328" text-anchor="start">Live preview</text>
+<text x="930" y="201" font-size="13" font-weight="400" fill="#59636e" text-anchor="start">with the learned</text>
+<text x="930" y="219" font-size="13" font-weight="400" fill="#59636e" text-anchor="start">HUD mask</text>
+<path d="M896 198 L912 198" fill="none" stroke="#8c959f" stroke-width="1.6" marker-end="url(#a)"/>
+<rect x="914" y="254" width="176" height="72" rx="8" fill="#ffffff" stroke="#d0d7de"/>
+<text x="930" y="283" font-size="15" font-weight="600" fill="#1f2328" text-anchor="start">Export PNG</text>
+<text x="930" y="302" font-size="13" font-weight="400" fill="#59636e" text-anchor="start">small holes filled in</text>
+<path d="M896 290 L912 290" fill="none" stroke="#8c959f" stroke-width="1.6" marker-end="url(#a)"/>
+<path d="M858 480 H896 V106" fill="none" stroke="#8c959f" stroke-width="1.6"/>
+<text x="904" y="472" font-size="12" font-weight="600" fill="#59636e" text-anchor="start">tiles, status</text>
+<text x="914" y="360" font-size="12" font-weight="400" fill="#59636e" text-anchor="start">Everything runs locally:</text>
+<text x="914" y="377" font-size="12" font-weight="400" fill="#59636e" text-anchor="start">no frames leave the device.</text>
+</svg>
