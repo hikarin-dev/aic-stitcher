@@ -1,5 +1,5 @@
 import { type ReactNode, useEffect, useRef, useState } from 'react'
-import { AlertCircle, Download, FileVideo, FlaskConical, Info, Loader2, MonitorUp, Pause, Play, Square } from 'lucide-react'
+import { AlertCircle, Download, FolderOpen, FlaskConical, Info, Loader2, MonitorUp, Pause, Play, Square } from 'lucide-react'
 import { ExportDialog } from '@/components/ExportDialog'
 import { LivePreview } from '@/components/LivePreview'
 import { MapViewer } from '@/components/MapViewer'
@@ -39,6 +39,28 @@ export default function App() {
       if (done) setNotice('Finished stitching the recording. Export it, or open another one to extend the map.')
     })
   }
+  const stitchImages = (files: File[]) => {
+    void api.stitchImages(files).then((r) => {
+      if (!r) return
+      const first = r.problems[0]
+      setNotice(
+        `Stitched ${r.placed} of ${r.total} image${r.total === 1 ? '' : 's'}.` +
+          (first ? ` ${first.name}: ${first.reason}` : '') +
+          (r.problems.length > 1 ? ` (and ${r.problems.length - 1} more)` : ''),
+      )
+    })
+  }
+  /** A recording, or any number of screenshots. */
+  const openFiles = (files: File[]) => {
+    const video = files.find((f) => f.type.startsWith('video/'))
+    const images = files.filter((f) => f.type.startsWith('image/'))
+    if (video) startFile(video)
+    else if (images.length > 0) stitchImages(images)
+    else if (files.length > 0) setNotice("That isn't a video or an image. Open a screen recording (MP4, WebM, MOV) or screenshots (PNG, JPEG).")
+  }
+  const working = api.busy !== null
+  // A recording being read, or the map being assembled from its still frames.
+  const progress = videoProgress ?? (api.busy === 'rebuild' ? api.rebuildProgress : null)
   const paused = preferences.settings.paused
   const hasMap = tileCount > 0
   const frame = capturing && status ? { x: status.x, y: status.y, w: status.width, h: status.height } : null
@@ -93,8 +115,23 @@ export default function App() {
     <TooltipProvider>
       <div className="flex h-dvh flex-col bg-background text-foreground">
         <header className="flex flex-wrap items-center gap-x-3 gap-y-2 border-b px-4 py-2.5">
-          <div className="flex items-baseline gap-2">
-            <h1 className="font-heading text-base font-semibold tracking-tight">AIC Stitcher</h1>
+          <div className="flex items-center gap-2.5">
+            {/* A plain link to the page itself: clicking the logo or the title reloads the app. */}
+            <a
+              href="./"
+              title="Reload AIC Stitcher"
+              className="flex items-center gap-2.5 rounded-md outline-none transition-opacity hover:opacity-80 focus-visible:ring-2 focus-visible:ring-ring"
+            >
+              {/* 96×87 like the file, so the rounded corners sit on the artwork itself. */}
+              <img
+                src={`${import.meta.env.BASE_URL}logo.webp`}
+                alt=""
+                width={96}
+                height={87}
+                className="h-8 w-auto shrink-0 rounded-md"
+              />
+              <h1 className="font-heading text-base font-semibold tracking-tight">AIC Stitcher</h1>
+            </a>
             <span className="hidden text-xs text-muted-foreground sm:inline">
               Endfield factory map, stitched in your browser
             </span>
@@ -112,9 +149,9 @@ export default function App() {
                     Share game window
                   </Button>
                 )}
-                <Button variant={CAN_SHARE ? 'outline' : 'default'} onClick={openRecording} disabled={starting}>
-                  {starting && !CAN_SHARE ? <Loader2 className="animate-spin" /> : <FileVideo />}
-                  Open recording
+                <Button variant={CAN_SHARE ? 'outline' : 'default'} onClick={openRecording} disabled={starting || working}>
+                  {(starting && !CAN_SHARE) || working ? <Loader2 className="animate-spin" /> : <FolderOpen />}
+                  Open files
                 </Button>
               </>
             )}
@@ -132,17 +169,19 @@ export default function App() {
             </Button>
           </div>
         </header>
-        {videoProgress !== null && (
+        {progress !== null && (
           <div className="flex items-center gap-3 border-b px-4 py-1.5 text-xs text-muted-foreground">
             <span className="shrink-0">
-              {paused
-                ? 'Paused'
-                : api.videoPass === 'start'
-                  ? 'Filling in the start (used for HUD detection)'
-                  : 'Stitching recording'}
+              {api.busy === 'rebuild' || api.videoPass === 'assemble'
+                ? 'Assembling the map from its still frames'
+                : paused
+                  ? 'Paused'
+                  : api.videoPass === 'start'
+                    ? 'Filling in the start (used for HUD detection)'
+                    : 'Stitching recording'}
             </span>
-            <Progress value={videoProgress * 100} className="flex-1" />
-            <span className="w-9 shrink-0 text-right tabular-nums">{Math.round(videoProgress * 100)}%</span>
+            <Progress value={progress * 100} className="flex-1" />
+            <span className="w-9 shrink-0 text-right tabular-nums">{Math.round(progress * 100)}%</span>
           </div>
         )}
 
@@ -206,11 +245,11 @@ export default function App() {
             <input
               ref={fileInput}
               type="file"
-              accept="video/*"
+              accept="video/*,image/*"
+              multiple
               className="hidden"
               onChange={(e) => {
-                const file = e.target.files?.[0]
-                if (file) startFile(file)
+                openFiles(Array.from(e.target.files ?? []))
                 e.target.value = ''
               }}
             />
@@ -226,11 +265,10 @@ export default function App() {
             onDragLeave={() => setDragging(false)}
             onDrop={(e) => {
               setDragging(false)
-              const file = e.dataTransfer.files[0]
-              if (!file || capturing) return
+              const files = Array.from(e.dataTransfer.files)
+              if (files.length === 0 || capturing) return
               e.preventDefault()
-              if (file.type.startsWith('video/')) startFile(file)
-              else setNotice("That file isn't a video. Drop a screen recording (MP4, WebM, MOV).")
+              openFiles(files)
             }}
           >
             <MapViewer
@@ -252,7 +290,7 @@ export default function App() {
             )}
             {dragging && (
               <div className="pointer-events-none absolute inset-3 flex items-center justify-center rounded-xl border-2 border-dashed border-primary bg-background/70 text-sm font-medium">
-                Drop the recording to stitch it
+                Drop a recording or screenshots to stitch them
               </div>
             )}
           </section>
@@ -287,7 +325,7 @@ function HowTo({ capturing, fromFile, starting, onShare, onOpenRecording }: HowT
         <p className="text-muted-foreground">
           {fromFile
             ? 'The first second or two is used to learn which pixels belong to the HUD, then the map starts filling in.'
-            : 'Pan at a steady pace with a fixed zoom level. For the first second or two the app learns which pixels belong to the HUD, then the map starts filling in.'}
+            : 'Pan with a fixed zoom level and stop for a moment every screen or so: frames taken while the camera stands still are the sharpest. For the first second or two the app learns which pixels belong to the HUD, then the map starts filling in.'}
         </p>
       </Overlay>
     )
@@ -311,17 +349,17 @@ function HowTo({ capturing, fromFile, starting, onShare, onOpenRecording }: HowT
   const record = (
     <Option
       key="record"
-      icon={<FileVideo />}
-      title="Stitch a screen recording"
+      icon={<FolderOpen />}
+      title="Stitch a recording or screenshots"
       action={
         <Button size="sm" variant={CAN_SHARE ? 'outline' : 'default'} onClick={onOpenRecording} disabled={starting}>
-          <FileVideo /> Open recording
+          <FolderOpen /> Open files
         </Button>
       }
     >
       {CAN_SHARE
-        ? 'Works on phones too. Screen-record the AIC top-down view while you pan slowly, then open the video or drop it here.'
-        : 'Screen-record the AIC top-down view while you pan slowly, then open the video.'}
+        ? 'Works on phones too. Screen-record the AIC top-down view while you pan, or take screenshots that overlap by a third or so, then open them or drop them here.'
+        : 'Screen-record the AIC top-down view while you pan, or take screenshots that overlap by a third or so, then open them.'}
     </Option>
   )
 

@@ -1,5 +1,6 @@
 /** Frame sources: screen capture, video files and the demo. */
 import demoFactoryUrl from '@/assets/demo/aic-factory.webp'
+import { ENDFIELD_VIGNETTE } from './mosaic'
 import type { World } from './synthetic'
 
 interface TrackProcessor {
@@ -125,18 +126,23 @@ export async function stepThroughVideo(video: HTMLVideoElement, opts: VideoStepO
   }
 }
 
-function seek(video: HTMLVideoElement, t: number): Promise<void> {
+/** Moves a paused video to time `t` (seconds) and waits until that frame is decoded. */
+export function seek(video: HTMLVideoElement, t: number): Promise<void> {
   return new Promise((resolve, reject) => {
     const done = (err?: Error) => {
       video.removeEventListener('seeked', onSeeked)
       video.removeEventListener('error', onError)
+      video.removeEventListener('emptied', onEmptied)
       if (err) reject(err)
       else resolve()
     }
     const onSeeked = () => done()
     const onError = () => done(new Error('The video could not be decoded at ' + t.toFixed(2) + ' s.'))
+    // The video was closed while seeking: 'seeked' will never come.
+    const onEmptied = () => done(new Error('The video was closed.'))
     video.addEventListener('seeked', onSeeked)
     video.addEventListener('error', onError)
+    video.addEventListener('emptied', onEmptied)
     video.currentTime = t
   })
 }
@@ -192,7 +198,8 @@ export async function syntheticStream(width = 1280, height = 720): Promise<Media
     const p = path[i % path.length]
     const gain = 1 + 0.15 * Math.sin(i / 90)
     const shadow = 0.2 * (0.5 + 0.5 * Math.sin(i / 130))
-    const rgba = renderFrame(world, p.x, p.y, width, height, gain, shadow)
+    // With the game's vignette, so the demo exercises the same path as a real capture.
+    const rgba = renderFrame(world, p.x, p.y, width, height, gain, shadow, 7, ENDFIELD_VIGNETTE)
     ctx.putImageData(new ImageData(rgba, width, height), 0, 0)
     i++
   }, 1000 / 30)

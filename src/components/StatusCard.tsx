@@ -4,7 +4,12 @@ import { Progress } from '@/components/ui/progress'
 import type { StitcherApi } from '@/hooks/useStitcher'
 import { TILE_SIZE } from '@/stitcher/mosaic'
 
-const BYTES_PER_TILE = TILE_SIZE * TILE_SIZE * 6 // rgba + luma + quality
+// Per pixel: colour 4 + frame brightness 2 + luma, quality, confirmations 1 each. The lighting layer adds ~0.15 MB.
+const BYTES_PER_TILE = TILE_SIZE * TILE_SIZE * 9 + 150_000
+/** Share of the current view that contradicts the map above which the user is told. */
+const DISAGREEMENT_HINT = 0.12
+
+const percent = (v: number) => `${(v * 100).toFixed(v < 0.095 ? 1 : 0)}%`
 
 export function StatusCard({ api }: { api: StitcherApi }) {
   const { status, fps, captureState, preferences } = api
@@ -44,15 +49,24 @@ export function StatusCard({ api }: { api: StitcherApi }) {
             any part of the map that's already captured; it snaps back automatically.
           </p>
         )}
+        {capturing && status?.state === 'tracking' && status.disagreement > DISAGREEMENT_HINT && (
+          <p className="text-xs text-amber-400">
+            This view looks different from what the map has here (things moved, or an earlier pass was blurry). Hold
+            the camera still for a moment: still frames are the sharpest and replace it.
+          </p>
+        )}
         <dl className="grid grid-cols-2 gap-x-4 gap-y-1.5 text-xs">
           <Stat label="Frames / s" value={capturing ? fps.toFixed(0) : '–'} />
           <Stat label="Frame time" value={status ? `${status.processMs.toFixed(1)} ms` : '–'} />
           <Stat label="Capture" value={status ? `${status.width}×${status.height}` : '–'} />
           <Stat label="Position" value={status ? `${status.x}, ${status.y}` : '–'} />
           <Stat label="Match" value={status?.matchScore != null ? status.matchScore.toFixed(2) : '–'} />
-          <Stat label="Lighting" value={status ? `×${(1 / status.gain).toFixed(2)}` : '–'} />
+          <Stat label="Low confidence" value={status ? percent(status.weak) : '–'} />
+          <Stat label="Not yet sharp" value={status ? percent(status.soft) : '–'} />
           <Stat label="Map tiles" value={String(tiles)} />
           <Stat label="Memory" value={`${memMb.toFixed(0)} MB`} />
+          <Stat label="Last draw" value={status?.drawMode ?? '–'} />
+          <Stat label="Still frames" value={status ? String(status.keyframes) : '–'} />
         </dl>
       </CardContent>
     </Card>

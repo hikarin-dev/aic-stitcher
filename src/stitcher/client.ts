@@ -1,5 +1,5 @@
 import type { TilePreview, WorkerRequest, WorkerResponse, WorldRect } from './protocol'
-import type { FrameStatus, StitchSettings } from './stitcher'
+import type { FrameStatus, ImageStitchResult, RebuildResult, StitchSettings } from './stitcher'
 
 export interface ClientEvents {
   status?: (status: FrameStatus, fps: number) => void
@@ -15,9 +15,12 @@ export class StitcherClient {
   private worker: Worker
   private events: ClientEvents = {}
   private nextRequestId = 1
-  /** Export and export-preview requests awaiting the worker's answer. */
+  /** Requests awaiting the worker's answer (exports, image batches, rebuilds). */
   private pending = new Map<number, { resolve: (r: never) => void; reject: (e: Error) => void }>()
   private frameWaiter: (() => void) | null = null
+  /** While a rebuild runs: how it gets frames again, and who hears about its progress. */
+  private fetchFrame: ((key: number) => Promise<VideoFrame | null>) | null = null
+  private rebuildProgress: ((progress: number) => void) | null = null
 
   constructor() {
     this.worker = new Worker(new URL('./worker.ts', import.meta.url), { type: 'module' })
@@ -31,6 +34,34 @@ export class StitcherClient {
 
   private send(msg: WorkerRequest, transfer: Transferable[] = []): void {
     this.worker.postMessage(msg, transfer)
+  }
+
+  /** Stitches still images (screenshots) into the map. The bitmaps are consumed. */
+  stitchImages(images: ImageBitmap[]): Promise<ImageStitchResult> {
+    const id = this.nextRequestId++
+    return new Promise<ImageStitchResult>((resolve, reject) => {
+      this.pending.set(id, { resolve: resolve as (r: never) => void, reject })
+      this.send({ type: 'images', id, images }, images)
+    })
+  }
+
+  /**
+   * Rebuilds the map from the still frames kept so far. Resolves null if there are none.
+   * @param fetchFrame given for a recording: returns the frame that was pushed with
+   *   that `refetchKey` again (or null). The rebuild can then use every still frame,
+   *   not only those whose pixels fit in memory.
+   * @param onProgress called with 0..1 as patches go in
+   */
+  rebuild(
+    fetchFrame?: (key: number) => Promise<VideoFrame | null>,
+    onProgress?: (progress: number) => void,
+  ): Promise<RebuildResult | null> {
+    this.fetchFrame = fetchFrame ?? null
+    this.rebuildProgress = onProgress ?? null
+    return this.request<RebuildResult | null>((id) => ({ type: 'rebuild', id, canFetch: !!fetchFrame })).finally(() => {
+      this.fetchFrame = null
+      this.rebuildProgress = null
+    })
   }
 
   private handle(msg: WorkerResponse): void {
@@ -60,6 +91,22 @@ export class StitcherClient {
       case 'export-preview':
         this.settle<ExportPreview>(msg.id, { bitmap: msg.bitmap, bounds: msg.bounds })
         break
+      case 'images-done':
+        this.settle<ImageStitchResult>(msg.id, msg.result)
+        break
+      case 'rebuilt':
+        this.settle<RebuildResult | null>(msg.id, msg.result)
+        break
+      case 'need-frame': {
+        const id = msg.id
+        const answer = (frame: VideoFrame | null) => this.send({ type: 'rebuild-frame', id, frame }, frame ? [frame] : [])
+        if (!this.fetchFrame) answer(null)
+        else this.fetchFrame(msg.key).then(answer, () => answer(null))
+        break
+      }
+      case 'rebuild-progress':
+        this.rebuildProgress?.(msg.done / msg.total)
+        break
       case 'export-failed': {
         const p = this.pending.get(msg.id)
         this.pending.delete(msg.id)
@@ -76,11 +123,15 @@ export class StitcherClient {
     this.send({ type: 'start-stream', stream }, [stream as unknown as Transferable])
   }
 
-  /** Push one frame (fallback path); resolves when the worker is ready for the next. */
-  pushFrame(frame: VideoFrame): Promise<void> {
+  /**
+   * Push one frame (fallback path); resolves when the worker is ready for the next.
+   * @param refetchKey set if this very frame can be delivered again later (see
+   *   `rebuild`): whatever identifies it, e.g. its time in a recording
+   */
+  pushFrame(frame: VideoFrame, refetchKey?: number): Promise<void> {
     return new Promise((resolve) => {
       this.frameWaiter = resolve
-      this.send({ type: 'frame', frame }, [frame])
+      this.send({ type: 'frame', frame, refetchKey }, [frame])
     })
   }
 

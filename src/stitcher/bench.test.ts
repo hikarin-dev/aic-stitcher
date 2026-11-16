@@ -36,7 +36,8 @@ it.runIf(!!process.env.BENCH)('bench 1080p stages', () => {
   t('mask compute', () => est.computeMask(m))
   const q = new Uint8Array(W * H).fill(200)
   const ss = new SampleSet()
-  t('selectSamples', () => selectSamples(lum, q, W, H, 4, 10, ss))
+  const field = { shade: new Float32Array([100]), w: 1, h: 1, scale: W }
+  t('selectSamples', () => selectSamples(lum, q, W, H, 4, 10, ss, field))
   console.log('samples', ss.count)
   const r = 11, rw = W + 2 * r, rh = H + 2 * r
   const region = new Uint8Array(rw * rh), rq = new Uint8Array(rw * rh).fill(1)

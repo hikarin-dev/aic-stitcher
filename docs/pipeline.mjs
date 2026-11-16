@@ -81,8 +81,8 @@ const steps = [
   ['Coarse motion', 'phase correlation (FFT)'],
   ['Fine alignment', 'block ZNCC against the map'],
   ['Learn the HUD', 'pixels that stay put while panning'],
-  ['Fix lighting', '8×5 gain field matched to the map'],
-  ['Composite', 'whole blobs, seams avoid facilities'],
+  ['Split lighting', 'frame brightness apart from detail'],
+  ['Composite', 'one sample per object, shared lighting'],
 ]
 const STX = WX + 24
 const STW = 290
@@ -150,7 +150,7 @@ const markers = [C.arrow, C.red, C.purple]
   })
   .join('')
 
-const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" role="img" aria-label="Stitching pipeline: frame sources feed a web worker that prepares each frame, estimates motion, aligns it to the map, learns the HUD, corrects lighting and composites into a tiled mosaic, which the UI thread displays and exports.">
+const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" role="img" aria-label="Stitching pipeline: frame sources feed a web worker that prepares each frame, estimates motion, aligns it to the map, learns the HUD, separates lighting from detail and composites into a tiled mosaic, which the UI thread displays and exports.">
 <defs>${markers}</defs>
 <style>text { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; }</style>
 <rect width="${W}" height="${H}" rx="12" fill="${C.bg}"/>

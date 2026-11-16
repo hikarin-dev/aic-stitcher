@@ -149,6 +149,24 @@ export function distanceTransform(valid: Uint8Array, w: number, h: number, out: 
 }
 
 /**
+ * Bilinear sample of a coarse grid (`gw`×`gh`, each cell covering `scale`² pixels) at
+ * the centre of pixel (x, y). Clamps at the borders.
+ */
+export function sampleGrid(grid: Float32Array, gw: number, gh: number, scale: number, x: number, y: number): number {
+  const u = Math.max(0, Math.min(gw - 1, (x + 0.5) / scale - 0.5))
+  const v = Math.max(0, Math.min(gh - 1, (y + 0.5) / scale - 0.5))
+  const x0 = Math.floor(u)
+  const y0 = Math.floor(v)
+  const x1 = Math.min(gw - 1, x0 + 1)
+  const y1 = Math.min(gh - 1, y0 + 1)
+  const fx = u - x0
+  const fy = v - y0
+  const a = grid[y0 * gw + x0] * (1 - fx) + grid[y0 * gw + x1] * fx
+  const b = grid[y1 * gw + x0] * (1 - fx) + grid[y1 * gw + x1] * fx
+  return a * (1 - fy) + b * fy
+}
+
+/**
  * Separable box blur (sum, not average) with radius `r`; samples outside the image
  * are treated as 0. Use with a blurred validity mask for normalised convolution.
  */

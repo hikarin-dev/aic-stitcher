@@ -3,18 +3,45 @@ import {
   createFrameStream,
   loadVideoFile,
   requestWindowCapture,
+  seek,
   stepThroughVideo,
   supportsTrackProcessor,
   syntheticStream,
 } from '@/stitcher/capture'
 import { StitcherClient, type ExportPreview, type ExportResult } from '@/stitcher/client'
+import { CONF_SIZE, SHARP_Q, WEAK_Q } from '@/stitcher/mosaic'
 import type { WorldRect } from '@/stitcher/protocol'
-import { DEFAULT_SETTINGS, type FrameStatus, type StitchSettings } from '@/stitcher/stitcher'
+import {
+  DEFAULT_SETTINGS,
+  type FrameStatus,
+  type ImageStitchResult,
+  type RebuildResult,
+  type StitchSettings,
+} from '@/stitcher/stitcher'
 
 export interface TileEntry {
   tx: number
   ty: number
   bitmap: ImageBitmap
+  /** Confidence overlay (one pixel per confidence cell): red = weak, amber = not yet sharp. */
+  overlay?: OffscreenCanvas
+}
+
+/** Paints a tile's confidence grid: transparent where the map is sharp. */
+function confidenceOverlay(confidence: Uint8Array): OffscreenCanvas {
+  const canvas = new OffscreenCanvas(CONF_SIZE, CONF_SIZE)
+  const image = new ImageData(CONF_SIZE, CONF_SIZE)
+  for (let i = 0; i < confidence.length; i++) {
+    const v = confidence[i]
+    if (v === 0 || v >= SHARP_Q) continue
+    const weak = v < WEAK_Q
+    image.data[i * 4] = weak ? 239 : 245
+    image.data[i * 4 + 1] = weak ? 68 : 158
+    image.data[i * 4 + 2] = weak ? 68 : 11
+    image.data[i * 4 + 3] = weak ? 150 : 95
+  }
+  canvas.getContext('2d')!.putImageData(image, 0, 0)
+  return canvas
 }
 
 export interface TileStore {
@@ -35,6 +62,14 @@ const MAX_FULL_TILES = 200
 
 export type CaptureState = 'idle' | 'starting' | 'capturing'
 
+/** Work on the map that is not a capture: stitching screenshots, rebuilding from stills. */
+export type BusyState = 'images' | 'rebuild' | null
+
+export interface ImageBatchResult extends ImageStitchResult {
+  /** File names of the images that could not be used, with the reason. */
+  problems: Array<{ name: string; reason: string }>
+}
+
 /** Frames per second of video stitched from a file (what the replay tests are tuned on). */
 const VIDEO_SAMPLE_FPS = 15
 
@@ -42,18 +77,34 @@ export interface Preferences {
   settings: StitchSettings
   /** Frames wider than this are downscaled before stitching (speed vs. detail). 0 = native. */
   maxWidth: number
+  /** Rebuild the map from its still frames when a recording has been read to the end. */
+  assembleFromStills: boolean
 }
 
-const STORAGE_KEY = 'aic-stitcher:preferences:v1'
-const DEFAULT_PREFERENCES: Preferences = { settings: DEFAULT_SETTINGS, maxWidth: 1920 }
+const STORAGE_KEY = 'aic-stitcher:preferences:v2'
+/**
+ * Preferences saved before the processing resolution defaulted to native. They are
+ * carried over once, except for the resolution: v1 stored 1920 for everybody, chosen
+ * or not, so it can't be told apart from a choice.
+ */
+const STORAGE_KEY_V1 = 'aic-stitcher:preferences:v1'
+const DEFAULT_PREFERENCES: Preferences = { settings: DEFAULT_SETTINGS, maxWidth: 0, assembleFromStills: true }
 
 function loadPreferences(): Preferences {
   try {
-    const raw = localStorage.getItem(STORAGE_KEY)
+    let raw = localStorage.getItem(STORAGE_KEY)
+    let carriedOver = false
+    if (!raw) {
+      raw = localStorage.getItem(STORAGE_KEY_V1)
+      carriedOver = true
+    }
     if (!raw) return DEFAULT_PREFERENCES
     const parsed = JSON.parse(raw) as Partial<Preferences>
+    if (carriedOver) delete parsed.maxWidth
     return {
       maxWidth: typeof parsed.maxWidth === 'number' ? parsed.maxWidth : DEFAULT_PREFERENCES.maxWidth,
+      assembleFromStills:
+        typeof parsed.assembleFromStills === 'boolean' ? parsed.assembleFromStills : DEFAULT_PREFERENCES.assembleFromStills,
       settings: {
         ...DEFAULT_SETTINGS,
         ...parsed.settings,
@@ -101,7 +152,10 @@ export function useStitcher() {
   /** State of the most recently processed frame (status arrives before 'frame-done'). */
   const lastStateRef = useRef<FrameStatus['state'] | null>(null)
   /** Which pass over a video file is running (see startVideoFile). */
-  const [videoPass, setVideoPass] = useState<'main' | 'start'>('main')
+  const [videoPass, setVideoPass] = useState<'main' | 'start' | 'assemble'>('main')
+  const [busy, setBusy] = useState<BusyState>(null)
+  /** 0..1 while `busy` is 'rebuild'. */
+  const [rebuildProgress, setRebuildProgress] = useState(0)
 
   // Worker lifetime.
   useEffect(() => {
@@ -128,7 +182,12 @@ export function useStitcher() {
         for (const t of tiles) {
           const k = `${t.tx},${t.ty}`
           store.tiles.get(k)?.bitmap.close()
-          store.tiles.set(k, t)
+          store.tiles.set(k, {
+            tx: t.tx,
+            ty: t.ty,
+            bitmap: t.bitmap,
+            overlay: t.confidence ? confidenceOverlay(t.confidence) : undefined,
+          })
           // The full-resolution copy is now stale; the viewer re-requests it if visible.
           if (store.full.has(k)) store.stale.add(k)
         }
@@ -184,6 +243,29 @@ export function useStitcher() {
     stop?.()
   }, [])
 
+  /** Rebuilds the map from the still frames kept so far (see Stitcher.rebuildFromStills). */
+  const rebuildFromStills = useCallback(async (): Promise<RebuildResult | null> => {
+    const client = clientRef.current
+    if (!client) return null
+    setBusy('rebuild')
+    setRebuildProgress(0)
+    try {
+      return await client.rebuild(undefined, setRebuildProgress)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+      return null
+    } finally {
+      setBusy(null)
+    }
+  }, [])
+  /** Whether a screen share is running (not a recording being read). */
+  const sharingRef = useRef(false)
+  /** Whether a capture is assembled from its still frames when it ends. */
+  const assembleRef = useRef(preferences.assembleFromStills)
+  useEffect(() => {
+    assembleRef.current = preferences.assembleFromStills
+  }, [preferences.assembleFromStills])
+
   const begin = useCallback(async (getStream: (video: HTMLVideoElement) => Promise<MediaStream>) => {
     const client = clientRef.current
     if (!client) return
@@ -235,6 +317,7 @@ export function useStitcher() {
 
     const stop = () => {
       active = false
+      sharingRef.current = false
       client.stop()
       track.removeEventListener('ended', onEnded)
       for (const t of media.getTracks()) t.stop()
@@ -244,11 +327,16 @@ export function useStitcher() {
       video.srcObject = null
       setStream(null)
       setCaptureState('idle')
+      // Like a recording when it ends: while sharing, the map is put together from
+      // whatever frame was best for each spot at the time. Now that the sharing is
+      // over, assemble it from the frames where the camera stood still.
+      if (assembleRef.current) void rebuildFromStills()
     }
     stopRef.current = stop
+    sharingRef.current = true
     setStream(media)
     setCaptureState('capturing')
-  }, [stopCapture])
+  }, [stopCapture, rebuildFromStills])
 
   const startScreenCapture = useCallback(() => begin(() => requestWindowCapture()), [begin])
   const pausedRef = useRef(preferences.settings.paused)
@@ -320,7 +408,8 @@ export function useStitcher() {
           onProgress: setVideoProgress,
           onFrame: async (t) => {
             const timestamp = Math.round((sample++ * 1e6) / VIDEO_SAMPLE_FPS)
-            await client.pushFrame(new VideoFrame(video, { timestamp }))
+            // The time in the recording identifies the frame: it can be read again.
+            await client.pushFrame(new VideoFrame(video, { timestamp }), t)
             if (calibratedAt < 0 && lastStateRef.current !== 'calibrating') calibratedAt = t
           },
         })
@@ -331,6 +420,17 @@ export function useStitcher() {
           setVideoPass('start')
           setVideoProgress(0)
           await pass(calibratedAt)
+        }
+        if (active && assembleRef.current) {
+          // The whole recording has been placed: put the map together from its still
+          // frames, in large patches.
+          setVideoPass('assemble')
+          setVideoProgress(0)
+          await client.rebuild(async (t) => {
+            if (!active) return null
+            await seek(video, t)
+            return active ? new VideoFrame(video, { timestamp: 0 }) : null
+          }, setVideoProgress)
         }
         completed = active
       } catch (err) {
@@ -343,12 +443,49 @@ export function useStitcher() {
   )
   const startDemo = useCallback(() => begin(() => syntheticStream()), [begin])
 
+  /**
+   * Stitches screenshots into the map. Their order does not matter; each has to
+   * overlap the others (or the existing map) by about a quarter.
+   */
+  const stitchImages = useCallback(async (files: File[]): Promise<ImageBatchResult | null> => {
+    const client = clientRef.current
+    if (!client || files.length === 0) return null
+    setError(null)
+    setBusy('images')
+    try {
+      const problems: ImageBatchResult['problems'] = []
+      const names: string[] = []
+      const bitmaps: ImageBitmap[] = []
+      for (const file of files) {
+        try {
+          bitmaps.push(await createImageBitmap(file))
+          names.push(file.name)
+        } catch {
+          problems.push({ name: file.name, reason: 'The browser could not read it as an image.' })
+        }
+      }
+      if (bitmaps.length === 0) return { total: files.length, placed: 0, skipped: [], hudLearned: false, problems }
+      const result = await client.stitchImages(bitmaps)
+      for (const s of result.skipped) problems.push({ name: names[s.index], reason: s.reason })
+      return { ...result, total: files.length, problems }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+      return null
+    } finally {
+      setBusy(null)
+    }
+  }, [])
+
   useEffect(() => () => stopRef.current?.(), [])
 
   const updateSettings = useCallback((patch: Partial<StitchSettings>) => {
     setPreferences((p) => ({ ...p, settings: { ...p.settings, ...patch } }))
   }, [])
   const setMaxWidth = useCallback((maxWidth: number) => setPreferences((p) => ({ ...p, maxWidth })), [])
+  const setAssembleFromStills = useCallback(
+    (assembleFromStills: boolean) => setPreferences((p) => ({ ...p, assembleFromStills })),
+    [],
+  )
   const resetPreferences = useCallback(() => setPreferences(DEFAULT_PREFERENCES), [])
 
   const clearMap = useCallback(() => {
@@ -372,13 +509,16 @@ export function useStitcher() {
   const exportPreview = useCallback(async (): Promise<ExportPreview | null> => {
     const client = clientRef.current
     if (!client) return null
+    // An export in the middle of a screen share gets the assembled map too. (Does
+    // nothing if nothing was captured since the map was last assembled.)
+    if (sharingRef.current && assembleRef.current) await rebuildFromStills()
     try {
       return await client.exportPreview()
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err))
       return null
     }
-  }, [])
+  }, [rebuildFromStills])
 
   const exportPng = useCallback(async (crop?: WorldRect): Promise<ExportResult | null> => {
     const client = clientRef.current
@@ -414,6 +554,11 @@ export function useStitcher() {
     startScreenCapture,
     startVideoFile,
     startDemo,
+    stitchImages,
+    rebuildFromStills,
+    busy,
+    rebuildProgress,
+    setAssembleFromStills,
     stopCapture,
     clearMap,
     resetUiMask,

@@ -26,7 +26,16 @@ export class Relocalizer {
    * @param lum full-resolution frame luma
    * @param q frame quality map (0 = HUD / cropped)
    */
-  findCandidates(mosaic: Mosaic, lum: Uint8Array, q: Uint8Array, w: number, h: number, maxCandidates = 6): RelocCandidate[] {
+  findCandidates(
+    mosaic: Mosaic,
+    lum: Uint8Array,
+    q: Uint8Array,
+    w: number,
+    h: number,
+    maxCandidates = 6,
+    /** Smallest share of the frame that must lie on the map. */
+    minOverlap = 0.4,
+  ): RelocCandidate[] {
     const S = THUMB_SCALE
     const fw = Math.floor(w / S)
     const fh = Math.floor(h / S)
@@ -39,9 +48,9 @@ export class Relocalizer {
     }
     downscaleBox(lum, w, S, this.frame, fw, fh)
 
-    // A frame may overlap the map by as little as ~40% in each direction.
-    const padX = Math.ceil(fw * 0.6)
-    const padY = Math.ceil(fh * 0.6)
+    // A frame may hang off the map by all but `minOverlap` of itself in each direction.
+    const padX = Math.ceil(fw * (1 - minOverlap))
+    const padY = Math.ceil(fh * (1 - minOverlap))
     const map = mosaic.thumbMap(padX, padY)
     if (!map) return []
 
@@ -63,7 +72,7 @@ export class Relocalizer {
       }
     }
     if (n < 20) return []
-    const minOverlap = Math.max(20, n * 0.35)
+    const minSamples = Math.max(20, n * (minOverlap - 0.05))
 
     const { lum: ml, ok, w: mw, h: mh } = map
     const best: RelocCandidate[] = []
@@ -88,7 +97,7 @@ export class Relocalizer {
           s22 += b * b
           s12 += a * b
         }
-        if (c < minOverlap) continue
+        if (c < minSamples) continue
         const den = Math.sqrt((s11 - (s1 * s1) / c) * (s22 - (s2 * s2) / c))
         if (den < 1e-6) continue
         // Mild preference for larger overlap so tiny edge overlaps don't win by luck.

@@ -7,6 +7,7 @@ import { it } from 'vitest'
 import { DEFAULT_SETTINGS, Stitcher } from './stitcher'
 import { TILE_SIZE } from './mosaic'
 import { writeMosaicPng, writePng } from './testing/png'
+import { ENDFIELD_VIGNETTE } from './mosaic'
 import { makeWorld, renderFrame, sweepPath } from './synthetic'
 
 const OUT = process.env.DEBUG_OUT
@@ -21,10 +22,10 @@ it.runIf(!!OUT)(
     for (let i = 0; i < path.length; i++) {
       const gain = LIGHTING ? 1 + 0.2 * Math.sin(i / 25) : 1
       const shadow = LIGHTING ? 0.25 * (0.5 + 0.5 * Math.sin(i / 40)) : 0
-      const rgba = renderFrame(world, path[i].x, path[i].y, 640, 360, gain, shadow)
+      const rgba = renderFrame(world, path[i].x, path[i].y, 640, 360, gain, shadow, 7, ENDFIELD_VIGNETTE)
       if (i === 100) writePng(`${OUT}/frame.png`, rgba, 640, 360)
       const st = s.process({ rgba, width: 640, height: 360, timestamp: i * 33 })
-      if (i % 40 === 0) console.log(i, st.state, 'gain', st.gain.toFixed(3), 'true', gain.toFixed(3))
+      if (i % 40 === 0) console.log(i, st.state, st.drawMode, 'lighting', gain.toFixed(3))
     }
     writeMosaicPng(`${OUT}/mosaic.png`, s.mosaic)
     // Ratio map mosaic/truth (gray 128 = 1.0), reveals seams & misplaced content.
@@ -35,6 +36,8 @@ it.runIf(!!OUT)(
       const w = b.maxX - b.minX
       const h = b.maxY - b.minY
       const img = new Uint8ClampedArray(w * h * 4)
+      const shown = new Uint32Array(TILE_SIZE * TILE_SIZE)
+      let shownTile: unknown = null
       for (let y = 0; y < h; y++) {
         for (let x = 0; x < w; x++) {
           const wx = b.minX + x
@@ -43,13 +46,18 @@ it.runIf(!!OUT)(
           const o = (y * w + x) * 4
           img[o + 3] = 255
           if (!t) continue
+          if (t !== shownTile) {
+            shownTile = t
+            s.mosaic.renderTile(t, shown)
+          }
           const li = (wy - t.ty * TILE_SIZE) * TILE_SIZE + (wx - t.tx * TILE_SIZE)
           const gx = wx + offX
           const gy = wy + offY
           if (!t.q[li] || gx >= world.width || gy >= world.height) continue
           const wi = (gy * world.width + gx) * 3
           const truth = (world.rgb[wi] * 77 + world.rgb[wi + 1] * 150 + world.rgb[wi + 2] * 29) >> 8
-          const r = t.lum[li] / Math.max(1, truth)
+          const p = shown[li]
+          const r = (((p & 0xff) * 77 + ((p >>> 8) & 0xff) * 150 + ((p >>> 16) & 0xff) * 29) >> 8) / Math.max(1, truth)
           img[o] = img[o + 1] = img[o + 2] = 128 + (r - 1) * 300
           if (r > 1.3 || r < 0.7) img[o] = 255
         }

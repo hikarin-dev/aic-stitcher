@@ -6,9 +6,10 @@
  * so that capture keeps running while the page is in the background (the game has
  * focus, and Chrome throttles timers / rAF on hidden pages but not worker streams).
  */
-import { TILE_SIZE, type Tile } from './mosaic'
+import { CONF_SIZE, TILE_SIZE, type Tile } from './mosaic'
 import type { TilePreview, WorkerRequest, WorkerResponse, WorldRect } from './protocol'
-import { DEFAULT_SETTINGS, Stitcher } from './stitcher'
+import { DEFAULT_KEYFRAME_BYTES } from './stills'
+import { DEFAULT_SETTINGS, Stitcher, type StillImage } from './stitcher'
 
 interface WorkerScope {
   postMessage(message: WorkerResponse, transfer?: Transferable[]): void
@@ -23,7 +24,19 @@ const PREVIEW_INTERVAL_MS = 200
 const MASK_INTERVAL_MS = 500
 
 const stitcher = new Stitcher(DEFAULT_SETTINGS)
-let maxWidth = 1920
+/**
+ * Memory for the still frames of a screen share. Unlike those of a recording they can't
+ * be read again, and every stop that is dropped leaves its neighbours further apart,
+ * which shows where they are joined. Sharing only exists on desktops, so this can be
+ * generous: 1 GB holds about 70 stops at 1440p. (`deviceMemory` is Chrome's; it tops
+ * out at 8.)
+ */
+const LIVE_KEYFRAME_BYTES = (() => {
+  const gb = (navigator as { deviceMemory?: number }).deviceMemory ?? 8
+  return (gb >= 8 ? 1024 : gb >= 4 ? 640 : 320) * 1024 * 1024
+})()
+/** Frames wider than this are downscaled first. The UI sends the real value right away; native until then. */
+let maxWidth = Infinity
 let lockedSize: { w: number; h: number } | null = null
 
 let frameCanvas: OffscreenCanvas | null = null
@@ -34,40 +47,55 @@ const previewCanvas = new OffscreenCanvas(PREVIEW_SIZE, PREVIEW_SIZE)
 const previewCtx = previewCanvas.getContext('2d')!
 previewCtx.imageSmoothingQuality = 'high'
 
+/** Scratch buffer the map's tiles are rendered into (detail re-lit with the lighting layer). */
+const tilePixels = new Uint8ClampedArray(TILE_SIZE * TILE_SIZE * 4)
+const tilePixels32 = new Uint32Array(tilePixels.buffer)
+
 let reader: ReadableStreamDefaultReader<VideoFrame> | null = null
 let lastPreview = 0
 let lastMaskPost = 0
 let postedMaskVersion = -1
 const frameTimes: number[] = []
 
-function processFrame(frame: VideoFrame): void {
-  let w: number
-  let h: number
-  let timestamp: number
-  try {
-    const scale = Math.min(1, maxWidth / frame.displayWidth)
-    w = Math.max(16, Math.round(frame.displayWidth * scale))
-    h = Math.max(16, Math.round(frame.displayHeight * scale))
-    // The map has a fixed scale: once it has content, keep feeding frames at the size
-    // it was built with (a resolution change only applies after "Clear map").
-    if (lockedSize && !stitcher.mosaic.isEmpty) {
-      const sameAspect = Math.abs(lockedSize.w / lockedSize.h - w / h) < 0.01
-      if (sameAspect) {
-        w = lockedSize.w
-        h = lockedSize.h
-      }
+/** The size a source of `width`×`height` is processed at. */
+function processingSize(width: number, height: number): { w: number; h: number } {
+  const scale = Math.min(1, maxWidth / width)
+  let w = Math.max(16, Math.round(width * scale))
+  let h = Math.max(16, Math.round(height * scale))
+  // The map has a fixed scale: once it has content, keep feeding frames at the size
+  // it was built with (a resolution change only applies after "Clear map").
+  if (lockedSize && !stitcher.mosaic.isEmpty) {
+    const sameAspect = Math.abs(lockedSize.w / lockedSize.h - w / h) < 0.01
+    if (sameAspect) {
+      w = lockedSize.w
+      h = lockedSize.h
     }
-    timestamp = frame.timestamp / 1000
+  }
+  return { w, h }
+}
+
+/** The frame's pixels at the size the map is built at. Closes the frame. */
+function framePixels(frame: VideoFrame): ImageData {
+  try {
+    const { w, h } = processingSize(frame.displayWidth, frame.displayHeight)
     if (!frameCanvas || frameCanvas.width !== w || frameCanvas.height !== h) {
       frameCanvas = new OffscreenCanvas(w, h)
       frameCtx = frameCanvas.getContext('2d', { willReadFrequently: true, alpha: false })!
     }
     frameCtx!.drawImage(frame, 0, 0, w, h)
+    return frameCtx!.getImageData(0, 0, w, h)
   } finally {
     frame.close()
   }
-  const image = frameCtx!.getImageData(0, 0, w, h)
-  const status = stitcher.process({ rgba: image.data, width: w, height: h, timestamp })
+}
+
+function processFrame(frame: VideoFrame, refetchKey?: number): void {
+  stitcher.setKeyframeBudget(refetchKey === undefined ? LIVE_KEYFRAME_BYTES : DEFAULT_KEYFRAME_BYTES)
+  const timestamp = frame.timestamp / 1000
+  const image = framePixels(frame)
+  const w = image.width
+  const h = image.height
+  const status = stitcher.process({ rgba: image.data, width: w, height: h, timestamp, refetchKey })
   lockedSize = stitcher.mosaic.isEmpty ? null : { w, h }
 
   const now = performance.now()
@@ -86,8 +114,104 @@ function processFrame(frame: VideoFrame): void {
   }
 }
 
+/** Everything the UI shows about the map, after an operation that was not a frame. */
+function postMapState(): void {
+  postTiles(stitcher.mosaic.takeDirty())
+  const status = stitcher.idleStatus()
+  if (status) post({ type: 'status', status, fps: 0 })
+}
+
+function stitchImages(id: number, bitmaps: ImageBitmap[]): void {
+  const images: StillImage[] = []
+  for (const bitmap of bitmaps) {
+    const { w, h } = processingSize(bitmap.width, bitmap.height)
+    const canvas = new OffscreenCanvas(w, h)
+    const ctx = canvas.getContext('2d', { willReadFrequently: true, alpha: false })!
+    ctx.imageSmoothingQuality = 'high'
+    ctx.drawImage(bitmap, 0, 0, w, h)
+    bitmap.close()
+    // Each image keeps its own buffer: the stitcher holds on to it as a still frame.
+    images.push({ rgba: ctx.getImageData(0, 0, w, h).data, width: w, height: h })
+    // The first image decides the size for the rest of a new map.
+    if (!lockedSize && stitcher.mosaic.isEmpty) lockedSize = { w, h }
+  }
+  const result = stitcher.stitchImages(images)
+  if (stitcher.mosaic.isEmpty) lockedSize = null
+  postMapState()
+  post({ type: 'images-done', id, result })
+}
+
+/** A rebuild under way. It stays so across messages while it waits for a frame (see `need-frame`). */
+interface RebuildRun {
+  id: number
+  /** Hands over the frame it is waiting for. */
+  frameArrived: ((frame: VideoFrame | null) => void) | null
+  ended: boolean
+}
+let rebuildRun: RebuildRun | null = null
+
+/** Finishes a rebuild with the patches laid in so far, and reports it. */
+function endRebuild(run: RebuildRun, failure?: unknown): void {
+  if (run.ended) return
+  run.ended = true
+  if (rebuildRun === run) rebuildRun = null
+  const result = stitcher.rebuildEnd()
+  postMapState()
+  if (failure === undefined) post({ type: 'rebuilt', id: run.id, result })
+  else post({ type: 'export-failed', id: run.id, message: String(failure) })
+  // If it was waiting for a frame, it need not any longer.
+  const arrived = run.frameArrived
+  run.frameArrived = null
+  arrived?.(null)
+}
+
+/**
+ * Rebuilds the map from its still frames. Stills whose pixels were dropped to save
+ * memory are read from the recording again, one at a time, if the UI can do that.
+ */
+async function rebuild(id: number, canFetch: boolean): Promise<void> {
+  const plan = stitcher.rebuildBegin(canFetch)
+  if (!plan) {
+    postMapState()
+    post({ type: 'rebuilt', id, result: null })
+    return
+  }
+  const run: RebuildRun = { id, frameArrived: null, ended: false }
+  rebuildRun = run
+  try {
+    for (let i = 0; i < plan.patches.length; i++) {
+      const patch = plan.patches[i]
+      if (patch.inMemory) {
+        stitcher.rebuildPatch(i)
+      } else if (patch.key !== null) {
+        const key = patch.key
+        const frame = await new Promise<VideoFrame | null>((resolve) => {
+          run.frameArrived = resolve
+          post({ type: 'need-frame', id, key })
+        })
+        // Something else needed the map in the meantime: the rebuild was ended there.
+        if (run.ended) {
+          frame?.close()
+          return
+        }
+        if (frame) {
+          const image = framePixels(frame)
+          stitcher.rebuildPatch(i, { rgba: image.data, width: image.width, height: image.height })
+        }
+      }
+      post({ type: 'rebuild-progress', id, done: i + 1, total: plan.patches.length })
+      // Show the map as it comes together.
+      postTiles(stitcher.mosaic.takeDirty())
+    }
+    endRebuild(run)
+  } catch (err) {
+    endRebuild(run, err)
+  }
+}
+
 function renderPreview(tile: Tile): ImageBitmap {
-  tileCtx.putImageData(new ImageData(tile.rgba, TILE_SIZE, TILE_SIZE), 0, 0)
+  stitcher.mosaic.renderTile(tile, tilePixels32)
+  tileCtx.putImageData(new ImageData(tilePixels, TILE_SIZE, TILE_SIZE), 0, 0)
   previewCtx.clearRect(0, 0, PREVIEW_SIZE, PREVIEW_SIZE)
   previewCtx.drawImage(tileCanvas, 0, 0, PREVIEW_SIZE, PREVIEW_SIZE)
   return previewCanvas.transferToImageBitmap()
@@ -95,10 +219,14 @@ function renderPreview(tile: Tile): ImageBitmap {
 
 function postTiles(tiles: Tile[], cleared = false): void {
   if (tiles.length === 0 && !cleared) return
-  const previews: TilePreview[] = tiles.map((t) => ({ tx: t.tx, ty: t.ty, bitmap: renderPreview(t) }))
+  const previews: TilePreview[] = tiles.map((t) => {
+    const confidence = new Uint8Array(CONF_SIZE * CONF_SIZE)
+    stitcher.mosaic.confidence(t, confidence)
+    return { tx: t.tx, ty: t.ty, bitmap: renderPreview(t), confidence }
+  })
   post(
     { type: 'tiles', tiles: previews, tileSize: TILE_SIZE, previewScale: PREVIEW_SCALE, cleared },
-    previews.map((p) => p.bitmap),
+    previews.flatMap((p) => (p.confidence ? [p.bitmap, p.confidence.buffer] : [p.bitmap])),
   )
 }
 
@@ -158,7 +286,10 @@ async function postFullTiles(keys: Array<[number, number]>): Promise<void> {
   for (const [tx, ty] of keys) {
     const t = stitcher.mosaic.getTile(tx, ty)
     if (!t) continue
-    out.push({ tx, ty, bitmap: await createImageBitmap(new ImageData(t.rgba, TILE_SIZE, TILE_SIZE)) })
+    // A fresh buffer per tile: the bitmap is decoded asynchronously.
+    const pixels = new Uint8ClampedArray(TILE_SIZE * TILE_SIZE * 4)
+    stitcher.mosaic.renderTile(t, new Uint32Array(pixels.buffer))
+    out.push({ tx, ty, bitmap: await createImageBitmap(new ImageData(pixels, TILE_SIZE, TILE_SIZE)) })
   }
   post({ type: 'full-tiles', tiles: out }, out.map((t) => t.bitmap))
 }
@@ -180,7 +311,8 @@ function renderRegion(r: WorldRect, scale: number): OffscreenCanvas {
     const dx = t.tx * TILE_SIZE - r.x
     const dy = t.ty * TILE_SIZE - r.y
     if (dx >= r.w || dy >= r.h || dx + TILE_SIZE <= 0 || dy + TILE_SIZE <= 0) continue
-    const data = new ImageData(t.rgba, TILE_SIZE, TILE_SIZE)
+    stitcher.mosaic.renderTile(t, tilePixels32)
+    const data = new ImageData(tilePixels, TILE_SIZE, TILE_SIZE)
     if (scale === 1) {
       ctx.putImageData(data, dx, dy)
     } else {
@@ -221,15 +353,31 @@ async function exportPng(id: number, maxPixels: number, fillGaps: number, crop?:
   post({ type: 'exported', id, blob, width: out.width, height: out.height, scale })
 }
 
+/**
+ * Requests that work on the map. A rebuild that is waiting for a frame has the map
+ * half put together, so it is ended before any of these.
+ */
+const ENDS_REBUILD: ReadonlySet<WorkerRequest['type']> = new Set([
+  'start-stream',
+  'frame',
+  'stop',
+  'images',
+  'rebuild',
+  'clear-map',
+  'export-preview',
+  'export',
+])
+
 scope.onmessage = (event) => {
   const msg = event.data
+  if (rebuildRun && ENDS_REBUILD.has(msg.type)) endRebuild(rebuildRun)
   switch (msg.type) {
     case 'start-stream':
       void pump(msg.stream)
       break
     case 'frame':
       try {
-        processFrame(msg.frame)
+        processFrame(msg.frame, msg.refetchKey)
       } catch (err) {
         post({ type: 'error', message: String(err) })
       }
@@ -241,7 +389,31 @@ scope.onmessage = (event) => {
       const r = reader
       reader = null
       r?.cancel().catch(() => {})
+      // A recording that was being read is closed now: its frames can't be had again.
+      stitcher.forgetSource()
       postTiles(stitcher.mosaic.takeDirty())
+      break
+    }
+    case 'images':
+      try {
+        stitchImages(msg.id, msg.images)
+      } catch (err) {
+        post({ type: 'export-failed', id: msg.id, message: String(err) })
+      }
+      break
+    case 'rebuild':
+      void rebuild(msg.id, !!msg.canFetch)
+      break
+    case 'rebuild-frame': {
+      const run = rebuildRun?.id === msg.id ? rebuildRun : null
+      const arrived = run?.frameArrived
+      if (run && arrived) {
+        run.frameArrived = null
+        arrived(msg.frame)
+      } else {
+        // Nobody is waiting for it (any more).
+        msg.frame?.close()
+      }
       break
     }
     case 'settings':

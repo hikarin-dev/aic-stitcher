@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState, type PointerEvent, type ReactNode, type RefObject } from 'react'
-import { Crosshair, Maximize, Minus, Plus } from 'lucide-react'
+import { Crosshair, Maximize, Minus, Plus, ScanSearch } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import type { TileStore } from '@/hooks/useStitcher'
@@ -38,6 +38,8 @@ export function MapViewer({ store, version, frame, frameColor, onNeedFullTiles, 
   const frameRef = useRef(frame)
   const [mode, setMode] = useState<Mode>('fit')
   const [zoomPct, setZoomPct] = useState(25)
+  /** Tint the parts of the map that are not well captured yet. */
+  const [showConfidence, setShowConfidence] = useState(false)
 
   useLayoutEffect(() => {
     frameRef.current = frame
@@ -74,6 +76,15 @@ export function MapViewer({ store, version, frame, frameColor, onNeedFullTiles, 
       ctx.drawImage((hi ?? t).bitmap, x, y, T + pad, T + pad)
     }
     if (missing.length) onNeedFullTiles?.(missing)
+    if (showConfidence) {
+      ctx.imageSmoothingEnabled = false
+      for (const t of tiles.values()) {
+        const x = t.tx * T
+        const y = t.ty * T
+        if (!t.overlay || x > right || y > bottom || x + T < left || y + T < top) continue
+        ctx.drawImage(t.overlay, x, y, T, T)
+      }
+    }
     const f = frameRef.current
     if (f) {
       ctx.lineWidth = 2 / zoom
@@ -82,7 +93,7 @@ export function MapViewer({ store, version, frame, frameColor, onNeedFullTiles, 
       ctx.strokeRect(f.x, f.y, f.w, f.h)
       ctx.setLineDash([])
     }
-  }, [store, frameColor, onNeedFullTiles])
+  }, [store, frameColor, onNeedFullTiles, showConfidence])
 
   const requestDraw = useCallback(() => {
     if (raf.current) return
@@ -141,7 +152,7 @@ export function MapViewer({ store, version, frame, frameColor, onNeedFullTiles, 
       view.current.cy = frame.y + frame.h / 2
     }
     requestDraw()
-  }, [mode, version, frame, fit, requestDraw])
+  }, [mode, version, frame, fit, requestDraw, showConfidence])
 
   // Canvas sizing.
   useEffect(() => {
@@ -218,7 +229,24 @@ export function MapViewer({ store, version, frame, frameColor, onNeedFullTiles, 
         onPointerCancel={onPointerUp}
         onDoubleClick={() => setMode('fit')}
       />
+      {showConfidence && (
+        <div className="absolute bottom-3 left-3 flex flex-col gap-1 rounded-lg border bg-background/80 px-2.5 py-2 text-xs backdrop-blur">
+          <span className="flex items-center gap-2">
+            <span className="size-2.5 rounded-sm bg-red-500" /> Low confidence: only seen at the screen edge or under the HUD
+          </span>
+          <span className="flex items-center gap-2">
+            <span className="size-2.5 rounded-sm bg-amber-500" /> Not yet sharp: stop the camera here, or add a screenshot of it
+          </span>
+        </div>
+      )}
       <div className="absolute right-3 bottom-3 flex items-center gap-1 rounded-lg border bg-background/80 p-1 backdrop-blur">
+        <ViewButton
+          label="Show where the map is not well captured yet"
+          active={showConfidence}
+          onClick={() => setShowConfidence((v) => !v)}
+        >
+          <ScanSearch />
+        </ViewButton>
         <ViewButton label="Zoom out" onClick={() => zoomBy(1 / 1.5)}>
           <Minus />
         </ViewButton>

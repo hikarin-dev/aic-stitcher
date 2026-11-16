@@ -106,6 +106,28 @@ export function hudRects(fw: number, fh: number): HudRect[] {
   ]
 }
 
+let vignetteCache: { key: string; image: Float32Array } | null = null
+
+/** Brightness factor per screen pixel for vignette parameters θ (see `VIG_TERMS` in mosaic.ts). */
+function vignetteImage(fw: number, fh: number, theta: ArrayLike<number>): Float32Array {
+  const key = `${fw}x${fh}:${Array.from(theta).join(',')}`
+  if (vignetteCache?.key === key) return vignetteCache.image
+  const image = new Float32Array(fw * fh)
+  for (let y = 0; y < fh; y++) {
+    const v = ((y + 0.5) / fh) * 2 - 1
+    const v2 = v * v
+    for (let x = 0; x < fw; x++) {
+      const u = ((x + 0.5) / fw) * 2 - 1
+      const u2 = u * u
+      image[y * fw + x] = Math.exp(
+        theta[0] * u2 + theta[1] * v2 + theta[2] * u2 * u2 + theta[3] * v2 * v2 + theta[4] * u2 * v2 + theta[5] * u + theta[6] * v,
+      )
+    }
+  }
+  vignetteCache = { key, image }
+  return image
+}
+
 /** Renders a frame: world crop at (cx, cy), HUD on top, lighting applied. */
 export function renderFrame(
   world: World,
@@ -117,14 +139,17 @@ export function renderFrame(
   /** Horizontal screen-space shadow gradient strength (cloud edge), 0 = none. */
   shadow: number,
   hudSeed = 7,
+  /** Screen-fixed vignette under the HUD, as in the game (parameters as in `Mosaic.vignette`). */
+  vignette?: ArrayLike<number>,
 ): Uint8ClampedArray<ArrayBuffer> {
   const out = new Uint8ClampedArray(fw * fh * 4)
+  const vig = vignette ? vignetteImage(fw, fh, vignette) : null
   for (let y = 0; y < fh; y++) {
     for (let x = 0; x < fw; x++) {
       const wx = cx + x
       const wy = cy + y
       const o = (y * fw + x) * 4
-      const g = globalGain * (1 - shadow * (x / fw))
+      const g = globalGain * (1 - shadow * (x / fw)) * (vig ? vig[y * fw + x] : 1)
       if (wx < 0 || wy < 0 || wx >= world.width || wy >= world.height) {
         out[o] = out[o + 1] = out[o + 2] = 20
       } else {

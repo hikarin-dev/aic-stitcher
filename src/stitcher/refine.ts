@@ -6,6 +6,9 @@
  * (ZNCC), which is invariant to brightness gain/offset (lighting changes).
  */
 
+import { sampleGrid } from './image'
+import { NORM_FLOOR, NORM_LEVEL } from './mosaic'
+
 export const BLOCKS_X = 4
 export const BLOCKS_Y = 3
 const NB = BLOCKS_X * BLOCKS_Y
@@ -30,7 +33,19 @@ export class SampleSet {
   }
 }
 
-/** Picks textured, valid pixels on a regular grid. */
+/** A frame's local brightness on a coarse grid (see `CompositeInput.shade`). */
+export interface ShadeField {
+  shade: Float32Array
+  w: number
+  h: number
+  scale: number
+}
+
+/**
+ * Picks textured, valid pixels on a regular grid. Sample values are lighting-normalised
+ * the same way the mosaic stores its luma (surroundings → NORM_LEVEL), so the match is
+ * blind to cloud shadows and vignettes.
+ */
 export function selectSamples(
   lum: Uint8Array,
   q: Uint8Array,
@@ -39,6 +54,7 @@ export function selectSamples(
   stride: number,
   minGradient: number,
   out: SampleSet,
+  field: ShadeField,
 ): void {
   out.ensure(Math.ceil(w / stride) * Math.ceil(h / stride))
   let n = 0
@@ -48,9 +64,10 @@ export function selectSamples(
       if (q[i] === 0) continue
       const g = Math.abs(lum[i + 1] - lum[i - 1]) + Math.abs(lum[i + w] - lum[i - w])
       if (g < minGradient) continue
+      const shade = sampleGrid(field.shade, field.w, field.h, field.scale, x, y)
       out.x[n] = x
       out.y[n] = y
-      out.v[n] = lum[i]
+      out.v[n] = Math.min(255, (lum[i] * NORM_LEVEL) / Math.max(NORM_FLOOR, shade))
       out.block[n] = (((y * BLOCKS_Y) / h) | 0) * BLOCKS_X + (((x * BLOCKS_X) / w) | 0)
       n++
     }
