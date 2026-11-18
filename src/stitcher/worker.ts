@@ -9,7 +9,7 @@
 import { CONF_SIZE, TILE_SIZE, type Tile } from './mosaic'
 import type { TilePreview, WorkerRequest, WorkerResponse, WorldRect } from './protocol'
 import { DEFAULT_KEYFRAME_BYTES } from './stills'
-import { DEFAULT_SETTINGS, Stitcher, type StillImage } from './stitcher'
+import { DEFAULT_SETTINGS, Stitcher, type FrameStatus, type StillImage } from './stitcher'
 
 interface WorkerScope {
   postMessage(message: WorkerResponse, transfer?: Transferable[]): void
@@ -22,6 +22,8 @@ const PREVIEW_SCALE = 4
 const PREVIEW_SIZE = TILE_SIZE / PREVIEW_SCALE
 const PREVIEW_INTERVAL_MS = 200
 const MASK_INTERVAL_MS = 500
+/** Status updates (each one re-renders the UI) are sent at most this often, unless the state changes. */
+const STATUS_INTERVAL_MS = 100
 
 const stitcher = new Stitcher(DEFAULT_SETTINGS)
 /**
@@ -61,6 +63,8 @@ let reader: ReadableStreamDefaultReader<VideoFrame> | null = null
 let lastPreview = 0
 /** How long the last preview update took (ms). */
 let previewCost = 0
+let lastStatusPost = 0
+let lastStatusState: FrameStatus['state'] | null = null
 let lastMaskPost = 0
 let postedMaskVersion = -1
 const frameTimes: number[] = []
@@ -185,7 +189,12 @@ function stitchFrame(read: ReadFrame, refetchKey?: number): void {
   const now = performance.now()
   frameTimes.push(now)
   while (frameTimes.length > 0 && now - frameTimes[0] > 1000) frameTimes.shift()
-  post({ type: 'status', status, fps: frameTimes.length })
+  // Throttled: the UI can't show more than a few updates a second, and every one costs a re-render.
+  if (status.state !== lastStatusState || now - lastStatusPost >= STATUS_INTERVAL_MS) {
+    lastStatusState = status.state
+    lastStatusPost = now
+    post({ type: 'status', status, fps: frameTimes.length })
+  }
 
   // (Never more than about a fifth of the time goes into showing the map.)
   if (now - lastPreview > Math.max(PREVIEW_INTERVAL_MS, 4 * previewCost)) {
