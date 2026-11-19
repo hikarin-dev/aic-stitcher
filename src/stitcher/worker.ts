@@ -64,9 +64,21 @@ let lastPreview = 0
 let previewCost = 0
 let lastStatusPost = 0
 let lastStatusState: FrameStatus['state'] | null = null
+/** The newest status that the throttle held back; it goes out when the stream ends or capture stops. */
+let pendingStatus: { status: FrameStatus; fps: number } | null = null
 let lastMaskPost = 0
 let postedMaskVersion = -1
 const frameTimes: number[] = []
+
+/** Sends the status the throttle held back, if any, so the UI doesn't keep showing old numbers. */
+function flushStatus(): void {
+  if (!pendingStatus) return
+  const { status, fps } = pendingStatus
+  pendingStatus = null
+  lastStatusState = status.state
+  lastStatusPost = performance.now()
+  post({ type: 'status', status, fps })
+}
 
 /** The size a source of `width`×`height` is processed at. */
 function processingSize(width: number, height: number): { w: number; h: number } {
@@ -191,7 +203,10 @@ function stitchFrame(read: ReadFrame, refetchKey?: number): void {
   if (status.state !== lastStatusState || now - lastStatusPost >= STATUS_INTERVAL_MS) {
     lastStatusState = status.state
     lastStatusPost = now
+    pendingStatus = null
     post({ type: 'status', status, fps: frameTimes.length })
+  } else {
+    pendingStatus = { status, fps: frameTimes.length }
   }
 
   // (Never more than about a fifth of the time goes into showing the map.)
@@ -210,6 +225,8 @@ function stitchFrame(read: ReadFrame, refetchKey?: number): void {
 /** Everything the UI shows about the map, after an operation that was not a frame. */
 function postMapState(): void {
   postTiles(stitcher.mosaic.takeDirty())
+  // The status sent here is fresh, so a held-back one is out of date.
+  pendingStatus = null
   const status = stitcher.idleStatus()
   if (status) post({ type: 'status', status, fps: 0 })
 }
@@ -373,6 +390,7 @@ async function pump(stream: ReadableStream<VideoFrame>): Promise<void> {
   } finally {
     if (reader === own) {
       reader = null
+      flushStatus()
       postTiles(stitcher.mosaic.takeDirty())
       post({ type: 'stream-ended' })
     }
@@ -507,6 +525,7 @@ scope.onmessage = (event) => {
       r?.cancel().catch(() => {})
       // A recording that was being read is closed now: its frames can't be had again.
       stitcher.forgetSource()
+      flushStatus()
       postTiles(stitcher.mosaic.takeDirty())
       break
     }
