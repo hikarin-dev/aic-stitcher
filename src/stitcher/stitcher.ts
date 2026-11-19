@@ -1,4 +1,13 @@
-import { boxSum, dilate, distanceTransform, downscaleBox, downscaleBoxF32, erode, rgbaToLuma, type Pixels } from './image'
+import {
+  boxSum,
+  dilate,
+  distanceTransform,
+  downscaleBox,
+  downscaleBoxF32,
+  erode,
+  rgba32ToLuma,
+  type Pixels,
+} from './image'
 import { Mosaic, RATING_CORE, type WorldBox } from './mosaic'
 import { PhaseCorrelator, type Spectrum } from './phaseCorrelation'
 import { refineOffset, SampleSet, selectSamples, type RefineResult } from './refine'
@@ -181,8 +190,33 @@ const STOP_SETTLED = 0.6
  * sharp, and the latest wins too. A frame that is softer for whatever reason never does.
  */
 const STOP_MIN_SHARPNESS = 0.99
-/** Minimum camera movement between composited frames, as a fraction of the frame's short side. */
+/**
+ * Drawing a frame is the expensive part of processing it, so a stop is not redrawn
+ * with every frame. After the first, a frame is drawn if it is this much sharper than
+ * the picture the stop has, if this share of the screen has settled since (what had
+ * just scrolled in when the camera stopped, see FRESH_SETTLED), or when one of the two
+ * moments has come at which a frame counts for more than the ones before it
+ * (STILL_SETTLE, STOP_SETTLED).
+ */
+const STOP_SHARPER = 1.02
+const STOP_MORE_SETTLED = 0.03
+/**
+ * Minimum camera movement between frames that are drawn in full while panning, as a
+ * fraction of the frame's short side. What scrolls into view in between is filled in
+ * from every frame, which costs next to nothing (see MIN_MISSING); a full draw compares
+ * the whole frame with the map and is the expensive part of processing a frame. At
+ * this step every spot is still seen two or three times mid-screen on the way across.
+ */
+const PAN_STEP = 0.15
+/**
+ * The same for the first full draws after a stop. What sat on the screen during the
+ * stop (the cursor) is thrown out when two frames from elsewhere agree against it, and
+ * the sooner the better: those frames have to see the spot before it leaves the screen.
+ */
 const COMPOSITE_STEP = 0.05
+const FINE_STEPS_AFTER_STOP = 2
+/** The map's confidence figures (a scan of every tile that changed) are refreshed after this many draws. */
+const STATS_EVERY = 24
 /** A frame only confirms what the map shows if the camera moved this far (fraction of the short side). */
 const CONFIRM_STEP = 0.03
 const CONFIRM_MAX_SPEED = 1500
@@ -526,6 +560,9 @@ export class Stitcher {
   /** Whether a capture has drawn on the map since it was last rebuilt from its still frames. */
   private unassembled = false
   private qualityByDistance = new Uint8Array(4096)
+  /** Scratch for buildValidity: the mask cell each pixel column is in, and one mask row's quality. */
+  private cellOfColumn = new Int32Array(0)
+  private cellQuality = new Uint8Array(0)
   private ratingByDistance = new Uint8Array(4096)
   private samples = new SampleSet()
   private region = new Uint8Array(0)
@@ -639,7 +676,7 @@ export class Stitcher {
     this.frameIndex++
     const { settings, mosaic } = this
 
-    rgbaToLuma(rgba, g.lum, W * H)
+    rgba32ToLuma(rgba32, g.lum, W * H)
     downscaleBox(g.lum, W, g.ms, g.maskLumCur, g.mw, g.mh)
     downscaleBoxF32(g.maskLumCur, g.mw, g.ls, g.low, g.lw, g.lh)
     // (after `low` is derived: lighting needs the frame as captured, vignette included)
@@ -763,12 +800,18 @@ export class Stitcher {
           const calibrating = g.estimator.observations <= CALIBRATION_FRAMES
           if (calibrating || this.observationsSinceMask >= MASK_REFRESH) {
             if (this.maskBefore.length !== g.uiMask.length) this.maskBefore = new Uint8Array(g.uiMask.length)
-            this.maskBefore.set(g.uiMask)
+            const before = this.maskBefore
+            before.set(g.uiMask)
             g.estimator.computeMask(g.uiMask)
             this.observationsSinceMask = 0
-            this.validityDirty = true
-            this.maskVersion++
-            this.retractNewHud(g)
+            // Once learned, the mask mostly comes out the same: nothing to redo then.
+            let changed = false
+            for (let i = 0; i < before.length && !changed; i++) changed = before[i] !== g.uiMask[i]
+            if (changed) {
+              this.validityDirty = true
+              this.maskVersion++
+              this.retractNewHud(g)
+            }
           }
         }
       }
@@ -790,20 +833,37 @@ export class Stitcher {
         let speedFactor = Math.min(MOVING_MAX_QUALITY, 1 / (1 + speedRef / SPEED_HALF_QUALITY))
         if (this.stillFrames > 0) {
           // The camera stands still: these are the sharpest frames there are. Draw
-          // right away, then again with every frame while the picture is still settling
-          // (see STOP_SETTLED).
+          // right away, then again while the picture is still settling, whenever that
+          // improves it (see STOP_SHARPER).
           if (!this.stopDone) {
             const sharp = sharpness(g.lum, g.q, W, H)
-            if (this.stillDraws === 0 || sharp >= STOP_MIN_SHARPNESS * this.stopSharpness) {
+            const first = this.stillDraws === 0
+            let settledCells = 0
+            for (let i = 0; i < g.fresh.length; i++) if (g.fresh[i] >= 0.98) settledCells++
+            const due =
+              (this.stillTime >= STILL_SETTLE && this.stopDrawnAt < STILL_SETTLE) ||
+              this.stillTime >= STOP_SETTLED ||
+              settledCells - this.stopSettledCells >= STOP_MORE_SETTLED * g.fresh.length
+            if (
+              first ||
+              sharp >= STOP_SHARPER * this.stopSharpness ||
+              (due && sharp >= STOP_MIN_SHARPNESS * this.stopSharpness)
+            ) {
               drawMode = 'still'
               speedFactor = this.stillTime >= STILL_SETTLE ? 1 : STILL_BASE_QUALITY
-              if (this.stillDraws === 0 || sharp > this.stopSharpness) this.stopSharpness = sharp
+              if (first || sharp > this.stopSharpness) this.stopSharpness = sharp
+              this.stopDrawnAt = this.stillTime
+              this.stopSettledCells = settledCells
             }
           }
-        } else if ((settings.maxSpeed <= 0 || speed <= settings.maxSpeed) && drawnDist >= COMPOSITE_STEP * short) {
+        } else if (
+          (settings.maxSpeed <= 0 || speed <= settings.maxSpeed) &&
+          drawnDist >= (this.fullsSinceStop < FINE_STEPS_AFTER_STOP ? COMPOSITE_STEP : PAN_STEP) * short
+        ) {
           // Compositing is the most expensive step: while panning, only do it once the
-          // view has moved far enough to show something new.
+          // view has moved far enough (see PAN_STEP).
           drawMode = 'full'
+          this.fullsSinceStop++
         }
         // Whatever the map doesn't have yet is worth taking from any frame we can place.
         if (!drawMode && mosaic.countMissing(x, y, W, H, g.q) >= MIN_MISSING) drawMode = 'fill'
@@ -861,6 +921,7 @@ export class Stitcher {
               // What this frame alone shows of a spot, a rebuild from it should not put on the map.
               if (result.contradicted && this.stopKeyframe) this.suspect(this.stopKeyframe, result.contradicted)
               this.stillDraws++
+              this.fullsSinceStop = 0
               if (this.stillTime >= STOP_SETTLED) this.stopDone = true
               this.lastStop = { x, y }
             }
@@ -896,7 +957,7 @@ export class Stitcher {
     }
 
     // Map confidence is cached per tile; refresh the totals every few composites.
-    if (this.statsAge >= 8) {
+    if (this.statsAge >= STATS_EVERY) {
       this.statsAge = 0
       const s = mosaic.stats()
       this.weak = s.covered > 0 ? s.weak / s.covered : 0
@@ -1085,7 +1146,7 @@ export class Stitcher {
   /** Fills the per-frame buffers (luma, quality, rating, lighting) for a still frame. */
   private prepareStill(g: Geometry, rgba32: Uint32Array, valid: Uint8Array | null): void {
     const n = g.w * g.h
-    rgbaToLuma(new Uint8ClampedArray(rgba32.buffer, rgba32.byteOffset, n * 4), g.lum, n)
+    rgba32ToLuma(rgba32, g.lum, n)
     downscaleBox(g.lum, g.w, g.ms, g.maskLumCur, g.mw, g.mh)
     downscaleBoxF32(g.maskLumCur, g.mw, g.ls, g.low, g.lw, g.lh)
     this.buildValidity(g, valid, true)
@@ -1158,6 +1219,11 @@ export class Stitcher {
   private stopSharpness = 0
   /** The stop the camera is at has its picture (see STOP_SETTLED). */
   private stopDone = false
+  /** Full draws since the camera last stood still (see FINE_STEPS_AFTER_STOP). */
+  private fullsSinceStop = 0
+  /** Seconds into the stop at which its picture was last drawn, and how many screen cells were settled then. */
+  private stopDrawnAt = 0
+  private stopSettledCells = 0
 
   /**
    * Rebuilds the map from the still frames kept so far, in as few and as large patches
@@ -1349,7 +1415,7 @@ export class Stitcher {
     let guess: Uint8Array | null = null
     if (learnHud) {
       for (const m of subset) {
-        rgbaToLuma(new Uint8ClampedArray(m.rgba32.buffer, m.rgba32.byteOffset, W * H * 4), g.lum, W * H)
+        rgba32ToLuma(m.rgba32, g.lum, W * H)
         downscaleBox(g.lum, W, g.ms, g.maskLumCur, g.mw, g.mh)
         g.flattenMaskLum(this.mosaic.vignette)
         m.lum = g.maskLumCur.slice()
@@ -1729,18 +1795,47 @@ export class Stitcher {
     const cx = w / 2
     const cy = h / 2
     const fall = (255 - RATING_CORE) / Math.hypot(cx, cy)
-    for (let y = y0; y < y1; y++) {
-      const mrow = Math.min(mh - 1, (y / ms) | 0) * mw
-      const row = y * w
-      const dy2 = (y - cy) * (y - cy)
-      for (let x = x0; x < x1; x++) {
-        const mi = mrow + Math.min(mw - 1, (x / ms) | 0)
-        if ((useMask && uiMask[mi]) || (extra && !extra[mi])) continue
-        const d = dist[mi] < lutMax ? dist[mi] : lutMax
-        q[row + x] = lut[d]
-        if (!still) continue
-        const r = rateLut[d]
-        rate[row + x] = r !== 0 ? r : (255.5 - fall * Math.sqrt((x - cx) * (x - cx) + dy2)) | 0
+    if (!still) {
+      // The quality is the same for all pixels of a mask cell: worked out once per cell
+      // and spread over its pixels, and a row of pixels in the same mask row as the one
+      // above is a copy of that. (This runs whenever the HUD mask changes, which while
+      // it is being learned is every few frames.)
+      if (this.cellOfColumn.length !== w) this.cellOfColumn = new Int32Array(w)
+      if (this.cellQuality.length < mw) this.cellQuality = new Uint8Array(mw)
+      const { cellOfColumn, cellQuality } = this
+      for (let x = 0; x < w; x++) cellOfColumn[x] = Math.min(mw - 1, (x / ms) | 0)
+      let lastCellRow = -1
+      let lastRow = 0
+      for (let y = y0; y < y1; y++) {
+        const my = Math.min(mh - 1, (y / ms) | 0)
+        const row = y * w
+        if (my === lastCellRow) {
+          q.copyWithin(row + x0, lastRow + x0, lastRow + x1)
+          continue
+        }
+        const mrow = my * mw
+        for (let mx = 0; mx < mw; mx++) {
+          const mi = mrow + mx
+          cellQuality[mx] =
+            (useMask && uiMask[mi]) || (extra && !extra[mi]) ? 0 : lut[dist[mi] < lutMax ? dist[mi] : lutMax]
+        }
+        for (let x = x0; x < x1; x++) q[row + x] = cellQuality[cellOfColumn[x]]
+        lastCellRow = my
+        lastRow = row
+      }
+    } else {
+      for (let y = y0; y < y1; y++) {
+        const mrow = Math.min(mh - 1, (y / ms) | 0) * mw
+        const row = y * w
+        const dy2 = (y - cy) * (y - cy)
+        for (let x = x0; x < x1; x++) {
+          const mi = mrow + Math.min(mw - 1, (x / ms) | 0)
+          if ((useMask && uiMask[mi]) || (extra && !extra[mi])) continue
+          const d = dist[mi] < lutMax ? dist[mi] : lutMax
+          q[row + x] = lut[d]
+          const r = rateLut[d]
+          rate[row + x] = r !== 0 ? r : (255.5 - fall * Math.sqrt((x - cx) * (x - cx) + dy2)) | 0
+        }
       }
     }
 

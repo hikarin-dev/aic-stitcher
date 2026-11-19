@@ -246,6 +246,31 @@ describe('Mosaic', () => {
     expect(row[row.length - 1]).toBeGreaterThan(135)
   })
 
+  it('renders a tile at preview size like the full tile scaled down', () => {
+    const m = newMosaic()
+    // Left half of the tile covered: grey 100 with a darker band, the rest empty. The
+    // covered part ends in the middle of a preview pixel's block (x = 254).
+    m.composite({ ...frame(254, 512, () => 200, [{ x: 64, y: 0, w: 64, h: 512, v: 40 }]), x: 0, y: 0 })
+    const t = m.getTile(0, 0)!
+    const full = new Uint32Array(TILE_SIZE * TILE_SIZE)
+    m.renderTile(t, full)
+    const size = TILE_SIZE / 4
+    const small = new Uint32Array(size * size)
+    m.renderTilePreview(t, small, 2)
+    const at = (x: number, y: number) => small[y * size + x]
+    // Inside the picture: the same grey as the full tile there, opaque.
+    expect(at(8, 60) & 0xff).toBe(full[240 * TILE_SIZE + 34] & 0xff)
+    expect(at(20, 60) & 0xff).toBe(full[240 * TILE_SIZE + 82] & 0xff)
+    expect(at(20, 60) & 0xff).toBeLessThan(at(8, 60) & 0xff)
+    expect(at(8, 60) >>> 24).toBe(255)
+    // The block the picture ends in is half covered: half transparent, same grey.
+    expect(at(63, 60) >>> 24).toBe(128)
+    expect(at(63, 60) & 0xff).toBe(at(62, 60) & 0xff)
+    // Nothing there: nothing shown.
+    expect(at(64, 60)).toBe(0)
+    expect(at(100, 60)).toBe(0)
+  })
+
   it('reports how well each part of the map was captured', () => {
     const m = newMosaic()
     m.composite({ ...frame(256, 64, (x) => (x < 64 ? 20 : x < 128 ? 120 : 255)), x: 0, y: 0 })

@@ -149,7 +149,11 @@ export function useStitcher() {
   const [error, setError] = useState<string | null>(null)
   const [preferences, setPreferences] = useState<Preferences>(loadPreferences)
   const stopRef = useRef<(() => void) | null>(null)
-  /** State of the most recently processed frame (status arrives before 'frame-done'). */
+  /**
+   * State of the most recently stitched frame. When a pushed frame is reported done its
+   * pixels have been read but it is yet to be stitched (see the worker), so at that
+   * moment this is the state of the frame before it.
+   */
   const lastStateRef = useRef<FrameStatus['state'] | null>(null)
   /** Which pass over a video file is running (see startVideoFile). */
   const [videoPass, setVideoPass] = useState<'main' | 'start' | 'assemble'>('main')
@@ -397,8 +401,10 @@ export function useStitcher() {
       // Timestamps must keep increasing across the rewind (the stitcher derives pan speed
       // from them), so number the samples instead of using the media time.
       let sample = 0
-      /** Media time of the first frame that was not spent on calibration. */
+      /** Media time of a frame by which calibration was over (the one after the first that was drawn). */
       let calibratedAt = -1
+      // Until the first frame says otherwise.
+      lastStateRef.current = 'calibrating'
       const pass = (until?: number) =>
         stepThroughVideo(video, {
           interval: 1 / VIDEO_SAMPLE_FPS,

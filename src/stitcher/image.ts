@@ -9,26 +9,46 @@ export function rgbaToLuma(rgba: Pixels, out: Uint8Array, count: number): void {
   }
 }
 
+/** The same from little-endian RGBA words: one read per pixel instead of three. */
+export function rgba32ToLuma(rgba32: Uint32Array, out: Uint8Array, count: number): void {
+  for (let i = 0; i < count; i++) {
+    const p = rgba32[i]
+    out[i] = ((p & 0xff) * 77 + ((p >>> 8) & 0xff) * 150 + ((p >>> 16) & 0xff) * 29 + 128) >> 8
+  }
+}
+
 /**
  * Box-filter downscale by an integer factor `s`. Output is `floor(w/s)`×`floor(h/s)`.
  * (Separate from the Float32 variant on purpose: one function fed two array types
  * becomes polymorphic in V8 and runs several times slower.)
  */
+let boxRow = new Int32Array(0)
+
 export function downscaleBox(src: Uint8Array, w: number, s: number, out: Float32Array, ow: number, oh: number): void {
   const inv = 1 / (s * s)
-  out.fill(0)
+  if (boxRow.length < ow) boxRow = new Int32Array(ow)
+  const sum = boxRow
   for (let oy = 0; oy < oh; oy++) {
-    const orow = oy * ow
+    sum.fill(0, 0, ow)
     for (let sy = 0; sy < s; sy++) {
-      const srow = (oy * s + sy) * w
-      for (let ox = 0; ox < ow; ox++) {
-        let acc = 0
-        const base = srow + ox * s
-        for (let sx = 0; sx < s; sx++) acc += src[base + sx]
-        out[orow + ox] += acc
+      let p = (oy * s + sy) * w
+      // (The common factors spelled out: this runs over every pixel of every frame.)
+      if (s === 3) {
+        for (let ox = 0; ox < ow; ox++, p += 3) sum[ox] += src[p] + src[p + 1] + src[p + 2]
+      } else if (s === 2) {
+        for (let ox = 0; ox < ow; ox++, p += 2) sum[ox] += src[p] + src[p + 1]
+      } else if (s === 1) {
+        for (let ox = 0; ox < ow; ox++) sum[ox] += src[p + ox]
+      } else {
+        for (let ox = 0; ox < ow; ox++) {
+          let acc = 0
+          for (let sx = 0; sx < s; sx++) acc += src[p++]
+          sum[ox] += acc
+        }
       }
     }
-    for (let ox = 0; ox < ow; ox++) out[orow + ox] *= inv
+    const orow = oy * ow
+    for (let ox = 0; ox < ow; ox++) out[orow + ox] = sum[ox] * inv
   }
 }
 

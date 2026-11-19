@@ -45,7 +45,13 @@ const tileCanvas = new OffscreenCanvas(TILE_SIZE, TILE_SIZE)
 const tileCtx = tileCanvas.getContext('2d')!
 const previewCanvas = new OffscreenCanvas(PREVIEW_SIZE, PREVIEW_SIZE)
 const previewCtx = previewCanvas.getContext('2d')!
-previewCtx.imageSmoothingQuality = 'high'
+/** The preview is rendered at its own size (see Mosaic.renderTilePreview) into here... */
+const previewPixels = new Uint8ClampedArray(PREVIEW_SIZE * PREVIEW_SIZE * 4)
+const previewPixels32 = new Uint32Array(previewPixels.buffer)
+/** ...and goes through a second canvas: a bitmap taken from one right after putImageData() comes out blank in Chrome. */
+const previewStage = new OffscreenCanvas(PREVIEW_SIZE, PREVIEW_SIZE)
+const previewStageCtx = previewStage.getContext('2d')!
+const PREVIEW_SHIFT = Math.log2(PREVIEW_SCALE)
 
 /** Scratch buffer the map's tiles are rendered into (detail re-lit with the lighting layer). */
 const tilePixels = new Uint8ClampedArray(TILE_SIZE * TILE_SIZE * 4)
@@ -53,6 +59,8 @@ const tilePixels32 = new Uint32Array(tilePixels.buffer)
 
 let reader: ReadableStreamDefaultReader<VideoFrame> | null = null
 let lastPreview = 0
+/** How long the last preview update took (ms). */
+let previewCost = 0
 let lastMaskPost = 0
 let postedMaskVersion = -1
 const frameTimes: number[] = []
@@ -74,10 +82,59 @@ function processingSize(width: number, height: number): { w: number; h: number }
   return { w, h }
 }
 
-/** The frame's pixels at the size the map is built at. Closes the frame. */
-function framePixels(frame: VideoFrame): ImageData {
+/** A frame's pixels (RGBA) at the size the map is built at. */
+interface FramePixels {
+  data: Uint8ClampedArray
+  width: number
+  height: number
+}
+
+/**
+ * Whether VideoFrame.copyTo() converts to RGBA. Where it doesn't, the `format` option
+ * is silently ignored and the frame's own format comes back, so this is found out
+ * with a frame whose format is known: 2×2 pixels of I420 are 6 bytes, of RGBA 16.
+ */
+let copiesRgba = ((): boolean => {
+  try {
+    const probe = new VideoFrame(new Uint8Array(6), { format: 'I420', codedWidth: 2, codedHeight: 2, timestamp: 0 })
+    const ok = probe.allocationSize({ format: 'RGBA' } as VideoFrameCopyToOptions) === 16
+    probe.close()
+    return ok
+  } catch {
+    return false
+  }
+})()
+/**
+ * Where copied frames go. Two buffers, used in turn: the next frame is read while the
+ * current one is stitched (the stitcher copies what it keeps).
+ */
+const frameBuffers: Array<Uint8ClampedArray | null> = [null, null]
+let frameTurn = 0
+
+/**
+ * The frame's pixels at the size the map is built at. Closes the frame.
+ *
+ * At its own size a frame is copied straight out of the VideoFrame (the pixels are the
+ * same as a canvas gives, to the last bit). Going through a canvas (draw the frame,
+ * read the canvas back) is the only way to scale it, and somewhat slower.
+ */
+async function framePixels(frame: VideoFrame): Promise<FramePixels> {
   try {
     const { w, h } = processingSize(frame.displayWidth, frame.displayHeight)
+    const rect = frame.visibleRect
+    if (copiesRgba && rect && rect.width === w && rect.height === h && frame.displayWidth === w && frame.displayHeight === h) {
+      const size = w * h * 4
+      const turn = (frameTurn = 1 - frameTurn)
+      let data = frameBuffers[turn]
+      if (!data || data.length !== size) data = frameBuffers[turn] = new Uint8ClampedArray(size)
+      try {
+        await frame.copyTo(data, { format: 'RGBA' } as VideoFrameCopyToOptions)
+        return { data, width: w, height: h }
+      } catch {
+        // Not for this kind of frame, then: the canvas does it.
+        copiesRgba = false
+      }
+    }
     if (!frameCanvas || frameCanvas.width !== w || frameCanvas.height !== h) {
       frameCanvas = new OffscreenCanvas(w, h)
       frameCtx = frameCanvas.getContext('2d', { willReadFrequently: true, alpha: false })!
@@ -89,10 +146,37 @@ function framePixels(frame: VideoFrame): ImageData {
   }
 }
 
-function processFrame(frame: VideoFrame, refetchKey?: number): void {
-  stitcher.setKeyframeBudget(refetchKey === undefined ? LIVE_KEYFRAME_BYTES : DEFAULT_KEYFRAME_BYTES)
+/**
+ * Counts up whenever something other than the next frame takes over the map (a stop, a
+ * rebuild, clearing it...). A frame whose pixels were still being read at that moment
+ * is no longer wanted.
+ */
+let session = 0
+
+/** A frame that has been read and waits to be stitched. */
+interface ReadFrame {
+  image: FramePixels
+  /** Milliseconds. */
+  timestamp: number
+  /** `session` when the read began. */
+  session: number
+}
+
+/**
+ * Reading a frame's pixels mostly means waiting for the browser, and stitching can go
+ * on meanwhile: the two are separate steps so the next frame can be read while the
+ * current one is stitched.
+ */
+async function readFrame(frame: VideoFrame): Promise<ReadFrame> {
+  const mine = session
   const timestamp = frame.timestamp / 1000
-  const image = framePixels(frame)
+  return { image: await framePixels(frame), timestamp, session: mine }
+}
+
+function stitchFrame(read: ReadFrame, refetchKey?: number): void {
+  if (read.session !== session) return
+  stitcher.setKeyframeBudget(refetchKey === undefined ? LIVE_KEYFRAME_BYTES : DEFAULT_KEYFRAME_BYTES)
+  const { image, timestamp } = read
   const w = image.width
   const h = image.height
   const status = stitcher.process({ rgba: image.data, width: w, height: h, timestamp, refetchKey })
@@ -103,9 +187,11 @@ function processFrame(frame: VideoFrame, refetchKey?: number): void {
   while (frameTimes.length > 0 && now - frameTimes[0] > 1000) frameTimes.shift()
   post({ type: 'status', status, fps: frameTimes.length })
 
-  if (now - lastPreview > PREVIEW_INTERVAL_MS) {
-    lastPreview = now
+  // (Never more than about a fifth of the time goes into showing the map.)
+  if (now - lastPreview > Math.max(PREVIEW_INTERVAL_MS, 4 * previewCost)) {
     postTiles(stitcher.mosaic.takeDirty())
+    lastPreview = performance.now()
+    previewCost = lastPreview - now
   }
   if (status.maskVersion !== postedMaskVersion && now - lastMaskPost > MASK_INTERVAL_MS) {
     lastMaskPost = now
@@ -195,7 +281,9 @@ async function rebuild(id: number, canFetch: boolean): Promise<void> {
           return
         }
         if (frame) {
-          const image = framePixels(frame)
+          const image = await framePixels(frame)
+          // (The rebuild may have been ended while the pixels were being read.)
+          if (run.ended) return
           stitcher.rebuildPatch(i, { rgba: image.data, width: image.width, height: image.height })
         }
       }
@@ -210,10 +298,10 @@ async function rebuild(id: number, canFetch: boolean): Promise<void> {
 }
 
 function renderPreview(tile: Tile): ImageBitmap {
-  stitcher.mosaic.renderTile(tile, tilePixels32)
-  tileCtx.putImageData(new ImageData(tilePixels, TILE_SIZE, TILE_SIZE), 0, 0)
+  stitcher.mosaic.renderTilePreview(tile, previewPixels32, PREVIEW_SHIFT)
+  previewStageCtx.putImageData(new ImageData(previewPixels, PREVIEW_SIZE, PREVIEW_SIZE), 0, 0)
   previewCtx.clearRect(0, 0, PREVIEW_SIZE, PREVIEW_SIZE)
-  previewCtx.drawImage(tileCanvas, 0, 0, PREVIEW_SIZE, PREVIEW_SIZE)
+  previewCtx.drawImage(previewStage, 0, 0)
   return previewCanvas.transferToImageBitmap()
 }
 
@@ -253,14 +341,22 @@ async function pump(stream: ReadableStream<VideoFrame>): Promise<void> {
   reader = own
   previous?.cancel().catch(() => {})
   try {
+    // One frame ahead: while a frame is stitched, the pixels of the next are being read.
+    let ahead: Promise<ReadFrame> | null = null
     for (;;) {
       const { value, done } = await own.read()
       if (done || reader !== own) {
         value?.close()
         break
       }
+      const reading = readFrame(value)
+      // (Handled where it is awaited; this only keeps a failed read from going unheard.)
+      reading.catch(() => {})
+      const current = ahead
+      ahead = reading
+      if (!current) continue
       try {
-        processFrame(value)
+        stitchFrame(await current)
       } catch (err) {
         post({ type: 'error', message: String(err) })
       }
@@ -371,17 +467,30 @@ const ENDS_REBUILD: ReadonlySet<WorkerRequest['type']> = new Set([
 scope.onmessage = (event) => {
   const msg = event.data
   if (rebuildRun && ENDS_REBUILD.has(msg.type)) endRebuild(rebuildRun)
+  // (Anything that takes over the map, that is, except the next frame.)
+  if (msg.type !== 'frame' && ENDS_REBUILD.has(msg.type)) session++
   switch (msg.type) {
     case 'start-stream':
       void pump(msg.stream)
       break
     case 'frame':
-      try {
-        processFrame(msg.frame, msg.refetchKey)
-      } catch (err) {
-        post({ type: 'error', message: String(err) })
-      }
-      post({ type: 'frame-done' })
+      // "Done" as soon as the pixels are in: whoever pushes frames can fetch the next
+      // one (seeking a video takes a while) while this one is stitched. The stitching
+      // follows without a break, so nothing else gets in between.
+      readFrame(msg.frame).then(
+        (read) => {
+          post({ type: 'frame-done' })
+          try {
+            stitchFrame(read, msg.refetchKey)
+          } catch (err) {
+            post({ type: 'error', message: String(err) })
+          }
+        },
+        (err) => {
+          post({ type: 'error', message: String(err) })
+          post({ type: 'frame-done' })
+        },
+      )
       break
     case 'stop': {
       // Detach first so the pump doesn't report 'stream-ended' for a user-initiated stop

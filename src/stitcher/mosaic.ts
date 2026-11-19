@@ -79,6 +79,14 @@ export interface Tile {
   /** Accumulated weight behind `light` (0 = no observation). */
   lightW: Float32Array
   /**
+   * How far the lighting has moved since the tile was last marked as changed (log
+   * units), the largest step of one of its cells during the frame being folded in, and
+   * which frame that is. See LIGHT_REDRAW.
+   */
+  lightDrift: number
+  lightStep: number
+  lightFrame: number
+  /**
    * Weighted mean of the vignette basis at the screen positions this cell was seen
    * from (VIG_TERMS values per cell). The vignette's share of `light` is θ · this, so
    * it can be taken out again with whatever θ is known *now*: improving the vignette
@@ -312,6 +320,13 @@ const RELIGHT_DEADBAND = 0.01
 const RELIGHT_MIN_WEIGHT = 0.3
 /** The map is redrawn when a new vignette estimate changes brightness by more than this (log units). */
 const VIG_REDRAW = 0.004
+/**
+ * Every frame nudges the lighting of every tile it covers, mostly by next to nothing.
+ * A tile is only shown again (its preview rendered and sent to the page) once those
+ * nudges add up to this much brightness (log units; 0.006 is 0.6 %). Without this,
+ * every drawn frame has two dozen tiles redrawn for a change nobody can see.
+ */
+const LIGHT_REDRAW = 0.006
 /** Keeps the lighting ratio near 1 in very dark areas, where it is mostly noise. */
 const RATIO_SOFT = 6
 const RATIO_MIN = 0.5
@@ -446,6 +461,9 @@ export class Mosaic {
       n: new Uint8Array(TILE_PIXELS),
       light: new Float32Array(LIGHT_SIZE * LIGHT_SIZE),
       lightW: new Float32Array(LIGHT_SIZE * LIGHT_SIZE),
+      lightDrift: 0,
+      lightStep: 0,
+      lightFrame: -1,
       lightPhi: new Float32Array(LIGHT_SIZE * LIGHT_SIZE * VIG_TERMS),
       thumb: new Float32Array(THUMB_SIZE * THUMB_SIZE),
       thumbOk: new Uint8Array(THUMB_SIZE * THUMB_SIZE),
@@ -460,6 +478,7 @@ export class Mosaic {
     this.dirty.add(k)
     this.thumbDirty.add(k)
     t.counts = null
+    t.lightDrift = 0
   }
 
   takeDirty(): Tile[] {
@@ -793,6 +812,9 @@ export class Mosaic {
   private pad = new Float32Array(PAD * PAD)
   private padTmp = new Float32Array(PAD * PAD)
   private lightRow = new Float32Array(PAD)
+  /** Scratch for updateLight: a counter of its calls, and the tiles the current one has reached. */
+  private lightFrame = 0
+  private lightTiles: Tile[] = []
 
   /** Lighting cells of `t` plus a one-cell border from the neighbouring tiles; 0 = unknown. */
   private gatherLight(t: Tile): Float32Array {
@@ -848,6 +870,87 @@ export class Mosaic {
    * Renders a tile to displayable RGBA (little-endian words, alpha 0 where empty):
    * the captured colour of every pixel, re-lit with the shared lighting layer.
    */
+  /**
+   * The tile at 1/2^shift of its size, for the live preview: each output pixel is the
+   * average of four pixels spread over its block (of those that are covered), lit
+   * once. Rendering the tile in full and scaling that down gives next to the same
+   * picture for many times the work, and this runs for every tile a frame changes.
+   * Blocks that are only partly covered come out partly transparent.
+   * @param out (TILE_SIZE >> shift)² little-endian RGBA words, not premultiplied
+   */
+  renderTilePreview(t: Tile, out: Uint32Array, shift: number): void {
+    const { raw32, shade, q } = t
+    const step = 1 << shift
+    const size = TILE_SIZE >> shift
+    const half = step >> 1
+    const pad = this.blendLighting ? this.gatherLight(t) : null
+    const row = this.lightRow
+    const invShade = 1 / SHADE_ONE
+    // Two rows and two columns of each block (all of it, for blocks of 2×2).
+    const stride = step >= 4 ? step >> 1 : 1
+    const first = stride >> 1
+    const full = (step / stride) * (step / stride)
+    for (let oy = 0; oy < size; oy++) {
+      const y = (oy << shift) + half
+      if (pad) {
+        const r0 = LIGHT_IDX[y] * PAD
+        const r1 = r0 + PAD
+        const fy = LIGHT_FRAC[y]
+        for (let c = 0; c < PAD; c++) {
+          const a = pad[r0 + c]
+          const b = pad[r1 + c]
+          row[c] = a > 0 && b > 0 ? a + (b - a) * fy : a > 0 ? a : b
+        }
+      }
+      for (let ox = 0; ox < size; ox++) {
+        let r = 0
+        let g = 0
+        let b = 0
+        let s = 0
+        let n = 0
+        for (let dy = first; dy < step; dy += stride) {
+          const base = ((oy << shift) + dy) * TILE_SIZE + (ox << shift)
+          for (let dx = first; dx < step; dx += stride) {
+            const i = base + dx
+            if (q[i] === 0) continue
+            const p = raw32[i]
+            r += p & 0xff
+            g += (p >>> 8) & 0xff
+            b += (p >>> 16) & 0xff
+            s += shade[i]
+            n++
+          }
+        }
+        if (n === 0) {
+          out[oy * size + ox] = 0
+          continue
+        }
+        let ratio = 1
+        if (pad) {
+          const x = (ox << shift) + half
+          const c0 = LIGHT_IDX[x]
+          const la = row[c0]
+          const lb = row[c0 + 1]
+          const light = la > 0 && lb > 0 ? la + (lb - la) * LIGHT_FRAC[x] : la > 0 ? la : lb
+          if (light > 0) {
+            ratio = (light + RATIO_SOFT) / ((s / n) * invShade + RATIO_SOFT)
+            if (ratio < RATIO_MIN) ratio = RATIO_MIN
+            else if (ratio > RATIO_MAX) ratio = RATIO_MAX
+          }
+        }
+        const k = ratio / n
+        let pr = (r * k + 0.5) | 0
+        let pg = (g * k + 0.5) | 0
+        let pb = (b * k + 0.5) | 0
+        if (pr > 255) pr = 255
+        if (pg > 255) pg = 255
+        if (pb > 255) pb = 255
+        const alpha = n === full ? 255 : ((255 * n) / full + 0.5) | 0
+        out[oy * size + ox] = ((alpha << 24) | (pb << 16) | (pg << 8) | pr) >>> 0
+      }
+    }
+  }
+
   renderTile(t: Tile, out: Uint32Array): void {
     const { raw32, shade, q } = t
     if (!this.blendLighting) {
@@ -910,6 +1013,8 @@ export class Mosaic {
   private blockDiff = new Int32Array(0)
   private blockCount = new Uint16Array(0)
   private blockInvalid = new Uint8Array(0)
+  /** Per block: 1 if the frame may change something there (see the write step of composite). */
+  private blockBusy = new Uint8Array(0)
   private satDiff = new Float64Array(0)
   private satCount = new Int32Array(0)
   private blockLabel = new Int32Array(0)
@@ -997,6 +1102,7 @@ export class Mosaic {
       this.blockDiff = new Int32Array(nb)
       this.blockCount = new Uint16Array(nb)
       this.blockInvalid = new Uint8Array(nb)
+      this.blockBusy = new Uint8Array(nb)
       this.blockLabel = new Int32Array(nb)
       this.partLabel = new Int32Array(nb)
       this.stack = new Int32Array(nb)
@@ -1013,7 +1119,7 @@ export class Mosaic {
       this.rowNorm = new Float32Array(sw + 1)
     }
     const { sLum, sQ, sN, fLum, fScore, fShade, cls, blockConflicts, blockInvalid, blockLabel, stack } = this
-    const { colIdx, colFrac, rowShade, rowFresh, rowNorm, blockDiff, blockCount } = this
+    const { colIdx, colFrac, rowShade, rowFresh, rowNorm, blockDiff, blockCount, blockBusy } = this
     const fresh = f.fresh
     for (let x = 0; x < W; x++) {
       const u = Math.max(0, Math.min(sw - 1, (x + 0.5) / ss - 0.5))
@@ -1029,14 +1135,84 @@ export class Mosaic {
     const result: CompositeResult = { written: 0, filled: 0, overlap: 0, conflicts: 0 }
 
     this.extract(fx0, fy0, W, H, sLum, sQ, sN)
+    if (fillOnly) {
+      // Holes only: nothing is compared with the map, so one pass over the pixels it
+      // lacks does it. (They usually are a thin strip along the edge the camera is
+      // moving towards, plus a few specks: a frame that only fills costs next to nothing.)
+      const fillOwn = f.own ?? null
+      const fsf = Math.max(0.05, Math.min(1, f.speedFactor))
+      for (let y = 0; y < H; y++) {
+        const row = y * W
+        let first = 0
+        while (first < W && (sQ[row + first] !== 0 || q[row + first] === 0)) first++
+        if (first === W) continue
+        let last = W - 1
+        while (sQ[row + last] !== 0 || q[row + last] === 0) last--
+        const v = Math.max(0, Math.min(sh - 1, (y + 0.5) / ss - 0.5))
+        const y0 = Math.floor(v)
+        const fy = v - y0
+        const s0 = y0 * sw
+        const s1 = Math.min(sh - 1, y0 + 1) * sw
+        for (let c = 0; c < sw; c++) {
+          const shd = shade[s0 + c] + (shade[s1 + c] - shade[s0 + c]) * fy
+          rowShade[c] = shd * SHADE_ONE
+          rowNorm[c] = NORM_LEVEL / (shd > NORM_FLOOR ? shd : NORM_FLOOR)
+          rowFresh[c] = fresh ? (fresh[s0 + c] + (fresh[s1 + c] - fresh[s0 + c]) * fy) * fsf : fsf
+        }
+        rowShade[sw] = rowShade[sw - 1]
+        rowNorm[sw] = rowNorm[sw - 1]
+        rowFresh[sw] = rowFresh[sw - 1]
+        const wy = fy0 + y
+        const ty = wy >> TILE_SHIFT
+        const tRow = (wy & TILE_MASK) * TILE_SIZE
+        let t: Tile | undefined
+        let tx = Infinity
+        for (let x = first; x <= last; x++) {
+          const i = row + x
+          const fq = q[i]
+          if (sQ[i] !== 0 || fq === 0) continue
+          const wx = fx0 + x
+          if (wx >> TILE_SHIFT !== tx) {
+            tx = wx >> TILE_SHIFT
+            t = this.getTile(tx, ty) ?? this.createTile(tx, ty)
+            this.touch(t)
+          }
+          const c0 = colIdx[x]
+          const fr = colFrac[x]
+          const fs = (fq * (rowFresh[c0] + (rowFresh[c0 + 1] - rowFresh[c0]) * fr)) | 0
+          const s16 = (rowShade[c0] + (rowShade[c0 + 1] - rowShade[c0]) * fr + 0.5) | 0
+          let fl = (lum[i] * (rowNorm[c0] + (rowNorm[c0 + 1] - rowNorm[c0]) * fr) + 0.5) | 0
+          if (fl > 255) fl = 255
+          else if (fl < 1) fl = 1
+          const ti = tRow + (wx & TILE_MASK)
+          t!.raw32[ti] = rgba32[i] | 0xff000000
+          t!.shade[ti] = s16 < 1 ? 1 : s16 > 65535 ? 65535 : s16
+          t!.lum[ti] = fl
+          t!.q[ti] = fs > 0 ? fs : 1
+          t!.n[ti] = 1
+          if (fillOwn !== null) fillOwn[i] = 1
+          result.filled++
+          result.written++
+        }
+      }
+      if (!f.skipLight) this.updateLight(f)
+      return result
+    }
 
     // ---- 1. classify
     blockConflicts.fill(0, 0, nb)
     blockInvalid.fill(0, 0, nb)
     blockDiff.fill(0, 0, nb)
     blockCount.fill(0, 0, nb)
+    blockBusy.fill(0, 0, nb)
     const sf = Math.max(0.05, Math.min(1, f.speedFactor))
+    const confirm = f.confirm
+    // Agreement only confirms from a decent part of the frame: at the frame edge and
+    // in what has just scrolled in, frames agree with each other about missing icons.
+    const confirmMin = CONFIRM_ZONE * 255 * sf
+    const own = assemble ? null : (f.own ?? null)
     let candidates = 0
+    let overlap = 0
     for (let y = 0; y < H; y++) {
       const row = y * W
       const brow = (y >> BLOCK_SHIFT) * bw
@@ -1055,45 +1231,63 @@ export class Mosaic {
       rowShade[sw] = rowShade[sw - 1]
       rowNorm[sw] = rowNorm[sw - 1]
       rowFresh[sw] = rowFresh[sw - 1]
-      for (let x = 0; x < W; x++) {
-        const i = row + x
-        const fq = q[i]
-        if (fq === 0) {
-          cls[i] = SKIP
-          fLum[i] = 0 // "no data", for the next frame's witness lookup
-          blockInvalid[brow + (x >> BLOCK_SHIFT)] = 1
-          continue
-        }
+      for (let x = 0; x < W; ) {
+        // The pixels of one lighting cell interpolate between the same two corners.
         const c0 = colIdx[x]
-        const fr = colFrac[x]
-        const fs = (fq * (rowFresh[c0] + (rowFresh[c0 + 1] - rowFresh[c0]) * fr)) | 0
-        fScore[i] = fs > 0 ? fs : 1
-        const s16 = (rowShade[c0] + (rowShade[c0 + 1] - rowShade[c0]) * fr + 0.5) | 0
-        fShade[i] = s16 < 1 ? 1 : s16 > 65535 ? 65535 : s16
-        let fl = (lum[i] * (rowNorm[c0] + (rowNorm[c0 + 1] - rowNorm[c0]) * fr) + 0.5) | 0
-        if (fl > 255) fl = 255
-        else if (fl < 1) fl = 1
-        fLum[i] = fl
-        if (sQ[i] === 0) {
-          cls[i] = NEW
-        } else {
-          result.overlap++
-          // Difference in real brightness (64ths of a grey level): the normalised
-          // difference times how bright it is here. Judged on normalised luma alone,
-          // every bit of noise in dark machinery would count as a conflict.
-          const d = (((fl - sLum[i]) * (s16 > SHADE_FLOOR ? s16 : SHADE_FLOOR)) / NORM_LEVEL) | 0
+        const fresh0 = rowFresh[c0]
+        const freshD = rowFresh[c0 + 1] - fresh0
+        const shade0 = rowShade[c0]
+        const shadeD = rowShade[c0 + 1] - shade0
+        const norm0 = rowNorm[c0]
+        const normD = rowNorm[c0 + 1] - norm0
+        for (; x < W && colIdx[x] === c0; x++) {
+          const i = row + x
+          const fq = q[i]
+          if (fq === 0) {
+            cls[i] = SKIP
+            fLum[i] = 0 // "no data", for the next frame's witness lookup
+            blockInvalid[brow + (x >> BLOCK_SHIFT)] = 1
+            continue
+          }
+          const fr = colFrac[x]
+          let fs = (fq * (fresh0 + freshD * fr)) | 0
+          if (fs < 1) fs = 1
+          fScore[i] = fs
+          const s16 = (shade0 + shadeD * fr + 0.5) | 0
+          fShade[i] = s16 < 1 ? 1 : s16 > 65535 ? 65535 : s16
+          let fl = (lum[i] * (norm0 + normD * fr) + 0.5) | 0
+          if (fl > 255) fl = 255
+          else if (fl < 1) fl = 1
+          fLum[i] = fl
           const b = brow + (x >> BLOCK_SHIFT)
-          blockDiff[b] += d
-          blockCount[b]++
-          if (d > CONFLICT_DIFF * SHADE_ONE || d < -CONFLICT_DIFF * SHADE_ONE) {
-            cls[i] = CONFLICT // provisional, see below
-            candidates++
+          const mq = sQ[i]
+          if (mq === 0) {
+            cls[i] = NEW
+            blockBusy[b] = 1
           } else {
-            cls[i] = AGREE
+            overlap++
+            // Difference in real brightness (64ths of a grey level): the normalised
+            // difference times how bright it is here. Judged on normalised luma alone,
+            // every bit of noise in dark machinery would count as a conflict.
+            const d = (((fl - sLum[i]) * (s16 > SHADE_FLOOR ? s16 : SHADE_FLOOR)) / NORM_LEVEL) | 0
+            blockDiff[b] += d
+            blockCount[b]++
+            if (d > CONFLICT_DIFF * SHADE_ONE || d < -CONFLICT_DIFF * SHADE_ONE) {
+              cls[i] = CONFLICT // provisional, see below
+              candidates++
+            } else {
+              cls[i] = AGREE
+            }
+            // Could the write step have anything to do here (outside conflict blobs)? A
+            // better look, a confirmation still to be counted, or the stop's own pixels.
+            if (fs - mq > featherLo || (confirm && sN[i] < N_MAX && fs >= confirmMin) || (own !== null && own[i] !== 0)) {
+              blockBusy[b] = 1
+            }
           }
         }
       }
     }
+    result.overlap = overlap
     // A differing pixel is only a conflict if its surroundings differ too. Motion blur
     // and a pixel of misalignment move brightness around locally but keep the local
     // mean; a different object (an icon, a cursor, an item on a belt) changes it.
@@ -1227,9 +1421,6 @@ export class Mosaic {
     const odx = independent ? pdx : fx0 - this.pastX
     const ody = independent ? pdy : fy0 - this.pastY
     const witnessMin = WITNESS_ZONE * 255 * sf
-    // Agreement only confirms from a decent part of the frame: at the frame edge and
-    // in what has just scrolled in, frames agree with each other about missing icons.
-    const confirmMin = CONFIRM_ZONE * 255 * sf
     // A frame cannot discredit a sharper sample than it could deliver itself: blurry
     // frames panning past never wear down what a still frame captured.
     const frameTop = 255 * sf + 8
@@ -1476,8 +1667,8 @@ export class Mosaic {
     }
 
     // ---- 4. write
-    const confirm = f.confirm
-    const own = assemble ? null : (f.own ?? null)
+    // Block by block: most of a frame that pans over what the map already has changes
+    // nothing, and those blocks are skipped whole (see blockBusy).
     const tx0 = fx0 >> TILE_SHIFT
     const ty0 = fy0 >> TILE_SHIFT
     const tx1 = (fx0 + W - 1) >> TILE_SHIFT
@@ -1495,31 +1686,15 @@ export class Mosaic {
           const fOff = fy * W - fx0
           const brow = (fy >> BLOCK_SHIFT) * bw
           const tOff = (wy & TILE_MASK) * TILE_SIZE - (wx0 & ~TILE_MASK)
-          for (let wx = wx0; wx < wx1; wx++) {
-            const fi = fOff + wx
-            const c = cls[fi]
-            if (c === SKIP) continue
-            const ti = tOff + wx
-            if (c === NEW) {
-              if (!t) t = this.createTile(tx, ty)
-              t.raw32[ti] = rgba32[fi] | 0xff000000
-              t.shade[ti] = fShade[fi]
-              t.lum[ti] = fLum[fi]
-              t.q[ti] = fScore[fi]
-              t.n[ti] = 1
-              if (own !== null) own[fi] = 1
-              result.filled++
-              result.written++
-              touched = true
+          for (let wx = wx0; wx < wx1; ) {
+            const bx = (wx - fx0) >> BLOCK_SHIFT
+            const block = brow + bx
+            const end = Math.min(wx1, fx0 + ((bx + 1) << BLOCK_SHIFT))
+            const label = blockLabel[block]
+            if (label === 0 && blockBusy[block] === 0) {
+              wx = end
               continue
             }
-            if (fillOnly || !t) continue
-            // alpha: 0 = keep the stored pixel … 256 = replace it
-            let alpha = 0
-            const nn = sN[fi] || 1
-            let newN = nn
-            const block = brow + ((wx - fx0) >> BLOCK_SHIFT)
-            const label = blockLabel[block]
             let take = label > 0 ? takeFrame[label] : 2
             let wholeQ = blobQ[label]
             if (take === 2 && takePart !== null) {
@@ -1530,71 +1705,95 @@ export class Mosaic {
                 wholeQ = partQ![part]
               }
             }
-            const confirms = confirm && nn < N_MAX && fScore[fi] >= confirmMin
-            if (take === 1) {
-              alpha = 256
-              newN = c === AGREE ? (confirms ? nn + 1 : nn) : 1
-            } else {
-              const lead = fScore[fi] - sQ[fi]
-              // A lone differing pixel (no blob) is noise, not an object: it goes
-              // wherever its agreeing neighbours go, or it would be left behind as a speck.
-              if (c === AGREE || label === 0) {
-                if (confirms && c === AGREE) newN = nn + 1
-                // Same content, better look: switch over, feathered across a narrow band
-                // of quality lead (which is a narrow strip along the seam on the map).
-                if (take === 2 && lead > featherLo) {
-                  alpha = lead >= featherHi ? 256 : Math.max(1, (((lead - featherLo) << 8) / (featherHi - featherLo)) | 0)
-                }
-              } else if (take === 2 && lead >= switchLead && !(nn >= 2 && sQ[fi] >= SETTLED_Q)) {
-                // Different content and no object to keep whole: never mix the two.
-                alpha = 256
-                newN = 1
-              } else if (weaken[label] === 2) {
-                if (nn <= 1) {
-                  t.q[ti] = Math.max(1, sQ[fi] >> 1)
-                  touched = true
-                }
-              } else if (weaken[label] === 1 && nn > 1) {
-                newN = nn - 1
+            for (; wx < end; wx++) {
+              const fi = fOff + wx
+              const c = cls[fi]
+              if (c === SKIP) continue
+              const ti = tOff + wx
+              if (c === NEW) {
+                if (!t) t = this.createTile(tx, ty)
+                t.raw32[ti] = rgba32[fi] | 0xff000000
+                t.shade[ti] = fShade[fi]
+                t.lum[ti] = fLum[fi]
+                t.q[ti] = fScore[fi]
+                t.n[ti] = 1
+                if (own !== null) own[fi] = 1
+                result.filled++
+                result.written++
+                touched = true
+                continue
               }
-            }
-            if (own !== null && (alpha > 0 || own[fi] !== 0)) {
-              // One stop, one picture (see CompositeInput.own).
-              if (alpha !== 256) {
+              if (fillOnly || !t) continue
+              // alpha: 0 = keep the stored pixel … 256 = replace it
+              let alpha = 0
+              const nn = sN[fi] || 1
+              let newN = nn
+              const confirms = confirm && nn < N_MAX && fScore[fi] >= confirmMin
+              if (take === 1) {
                 alpha = 256
-                if (c !== AGREE) newN = 1
+                newN = c === AGREE ? (confirms ? nn + 1 : nn) : 1
+              } else {
+                const lead = fScore[fi] - sQ[fi]
+                // A lone differing pixel (no blob) is noise, not an object: it goes
+                // wherever its agreeing neighbours go, or it would be left behind as a speck.
+                if (c === AGREE || label === 0) {
+                  if (confirms && c === AGREE) newN = nn + 1
+                  // Same content, better look: switch over, feathered across a narrow band
+                  // of quality lead (which is a narrow strip along the seam on the map).
+                  if (take === 2 && lead > featherLo) {
+                    alpha = lead >= featherHi ? 256 : Math.max(1, (((lead - featherLo) << 8) / (featherHi - featherLo)) | 0)
+                  }
+                } else if (take === 2 && lead >= switchLead && !(nn >= 2 && sQ[fi] >= SETTLED_Q)) {
+                  // Different content and no object to keep whole: never mix the two.
+                  alpha = 256
+                  newN = 1
+                } else if (weaken[label] === 2) {
+                  if (nn <= 1) {
+                    t.q[ti] = Math.max(1, sQ[fi] >> 1)
+                    touched = true
+                  }
+                } else if (weaken[label] === 1 && nn > 1) {
+                  newN = nn - 1
+                }
               }
-              own[fi] = 1
+              if (own !== null && (alpha > 0 || own[fi] !== 0)) {
+                // One stop, one picture (see CompositeInput.own).
+                if (alpha !== 256) {
+                  alpha = 256
+                  if (c !== AGREE) newN = 1
+                }
+                own[fi] = 1
+              }
+              if (alpha === 256) {
+                t.raw32[ti] = rgba32[fi] | 0xff000000
+                t.shade[ti] = fShade[fi]
+                t.lum[ti] = fLum[fi]
+                t.q[ti] = take === 1 ? wholeQ : fScore[fi]
+                result.written++
+                touched = true
+              } else if (alpha > 0) {
+                // Colour and shade are mixed together, so the result still divides out to
+                // a consistent lighting-free colour.
+                const p = rgba32[fi]
+                const o = t.raw32[ti]
+                const or = o & 0xff
+                const og = (o >>> 8) & 0xff
+                const ob = (o >>> 16) & 0xff
+                const r = or + ((((p & 0xff) - or) * alpha) >> 8)
+                const g = og + (((((p >>> 8) & 0xff) - og) * alpha) >> 8)
+                const b = ob + (((((p >>> 16) & 0xff) - ob) * alpha) >> 8)
+                t.raw32[ti] = 0xff000000 | (b << 16) | (g << 8) | r
+                const os = t.shade[ti]
+                t.shade[ti] = os + (((fShade[fi] - os) * alpha) >> 8)
+                const ol = sLum[fi]
+                t.lum[ti] = ol + (((fLum[fi] - ol) * alpha) >> 8)
+                const oq = sQ[fi]
+                t.q[ti] = oq + Math.max(1, ((fScore[fi] - oq) * alpha) >> 8)
+                result.written++
+                touched = true
+              }
+              if (newN !== sN[fi]) t.n[ti] = newN
             }
-            if (alpha === 256) {
-              t.raw32[ti] = rgba32[fi] | 0xff000000
-              t.shade[ti] = fShade[fi]
-              t.lum[ti] = fLum[fi]
-              t.q[ti] = take === 1 ? wholeQ : fScore[fi]
-              result.written++
-              touched = true
-            } else if (alpha > 0) {
-              // Colour and shade are mixed together, so the result still divides out to
-              // a consistent lighting-free colour.
-              const p = rgba32[fi]
-              const o = t.raw32[ti]
-              const or = o & 0xff
-              const og = (o >>> 8) & 0xff
-              const ob = (o >>> 16) & 0xff
-              const r = or + ((((p & 0xff) - or) * alpha) >> 8)
-              const g = og + (((((p >>> 8) & 0xff) - og) * alpha) >> 8)
-              const b = ob + (((((p >>> 16) & 0xff) - ob) * alpha) >> 8)
-              t.raw32[ti] = 0xff000000 | (b << 16) | (g << 8) | r
-              const os = t.shade[ti]
-              t.shade[ti] = os + (((fShade[fi] - os) * alpha) >> 8)
-              const ol = sLum[fi]
-              t.lum[ti] = ol + (((fLum[fi] - ol) * alpha) >> 8)
-              const oq = sQ[fi]
-              t.q[ti] = oq + Math.max(1, ((fScore[fi] - oq) * alpha) >> 8)
-              result.written++
-              touched = true
-            }
-            if (newN !== sN[fi]) t.n[ti] = newN
           }
         }
         if (touched && t) this.touch(t)
@@ -2049,6 +2248,8 @@ export class Mosaic {
     }
     const phi = new Float64Array(K)
     const tileShift = TILE_SHIFT - LIGHT_SHIFT
+    const frameNo = ++this.lightFrame
+    const lightTiles = this.lightTiles
     for (let cy = cy0; cy <= cy1; cy++) {
       const py = cy * LIGHT_CELL + half - fy0
       const v = Math.max(0, Math.min(sh - 1, py / ss - 0.5))
@@ -2079,7 +2280,11 @@ export class Mosaic {
         if (tx !== tileTx) {
           tileTx = tx
           tile = this.getTile(tx, ty)
-          if (tile) this.touch(tile)
+          if (tile && tile.lightFrame !== frameNo) {
+            tile.lightFrame = frameNo
+            tile.lightStep = 0
+            lightTiles.push(tile)
+          }
         }
         if (!tile) continue
         const c0 = colIdx[k]
@@ -2105,8 +2310,11 @@ export class Mosaic {
           tile.light[li] = value
           tile.lightW[li] = weight
           for (let j = 0; j < K; j++) tile.lightPhi[po + j] = phi[j]
+          // A cell lit for the first time: that shows.
+          tile.lightStep = LIGHT_REDRAW
           continue
         }
+        const lightBefore = tile.light[li]
         // What this cell looked like from other screen positions vs. now: the
         // difference in brightness that goes with the difference in screen position
         // is the vignette. (Every fourth cell is plenty.)
@@ -2135,8 +2343,18 @@ export class Mosaic {
         tile.light[li] += (lit - tile.light[li]) * a
         for (let j = 0; j < K; j++) tile.lightPhi[po + j] += (phi[j] - tile.lightPhi[po + j]) * a
         tile.lightW[li] = wn > LIGHT_CAP ? LIGHT_CAP : wn
+        const moved = Math.abs(tile.light[li] - lightBefore)
+        if (moved > tile.lightStep) tile.lightStep = moved
       }
     }
+    for (const t of lightTiles) {
+      t.lightDrift += t.lightStep
+      if (t.lightDrift >= LIGHT_REDRAW) {
+        t.lightDrift = 0
+        this.dirty.add(key(t.tx, t.ty))
+      }
+    }
+    lightTiles.length = 0
     if (ns >= 200 && this.learnVignette) this.observeVignette(ns)
   }
 

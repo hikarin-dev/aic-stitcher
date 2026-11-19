@@ -109,15 +109,61 @@ export function refineOffset(
   let bx = 0
   let by = 0
   let bestOverlap = 0
-  for (let oy = -radius; oy <= radius; oy++) {
-    for (let ox = -radius; ox <= radius; ox++) {
-      const r = zncc(samples, step1, region, regionQ, (oy + radius) * rw + ox + radius)
-      if (r.n < minOverlap(n1)) continue
-      if (r.score > best) {
-        best = r.score
-        bx = ox
-        by = oy
-        bestOverlap = r.n
+  const side = 2 * radius + 1
+  const step0 = step1 * SCOUT_THIN
+  const n0 = Math.ceil(count / step0)
+  if (side * side > 4 * SCOUT_KEEP * (2 * SCOUT_REACH + 1) ** 2 && n0 >= 200) {
+    // Most of the window is nowhere near the answer. A first look with a fraction of
+    // the samples picks out the few places that deserve a proper one.
+    if (visited.length < side * side) visited = new Uint8Array(side * side)
+    visited.fill(0, 0, side * side)
+    scoutScore.fill(-Infinity)
+    for (let oy = -radius; oy <= radius; oy++) {
+      for (let ox = -radius; ox <= radius; ox++) {
+        const r = zncc(samples, step0, region, regionQ, (oy + radius) * rw + ox + radius)
+        if (r.n < minOverlap(n0)) continue
+        // Keep the best few, best first.
+        let k = SCOUT_KEEP
+        while (k > 0 && r.score > scoutScore[k - 1]) k--
+        if (k === SCOUT_KEEP) continue
+        for (let m = SCOUT_KEEP - 1; m > k; m--) {
+          scoutScore[m] = scoutScore[m - 1]
+          scoutAt[m] = scoutAt[m - 1]
+        }
+        scoutScore[k] = r.score
+        scoutAt[k] = (oy + radius) * side + ox + radius
+      }
+    }
+    for (let k = 0; k < SCOUT_KEEP && scoutScore[k] > -Infinity; k++) {
+      const cy = ((scoutAt[k] / side) | 0) - radius
+      const cx = (scoutAt[k] % side) - radius
+      for (let oy = Math.max(-radius, cy - SCOUT_REACH); oy <= Math.min(radius, cy + SCOUT_REACH); oy++) {
+        for (let ox = Math.max(-radius, cx - SCOUT_REACH); ox <= Math.min(radius, cx + SCOUT_REACH); ox++) {
+          const at = (oy + radius) * side + ox + radius
+          if (visited[at]) continue
+          visited[at] = 1
+          const r = zncc(samples, step1, region, regionQ, (oy + radius) * rw + ox + radius)
+          if (r.n < minOverlap(n1)) continue
+          if (r.score > best) {
+            best = r.score
+            bx = ox
+            by = oy
+            bestOverlap = r.n
+          }
+        }
+      }
+    }
+  } else {
+    for (let oy = -radius; oy <= radius; oy++) {
+      for (let ox = -radius; ox <= radius; ox++) {
+        const r = zncc(samples, step1, region, regionQ, (oy + radius) * rw + ox + radius)
+        if (r.n < minOverlap(n1)) continue
+        if (r.score > best) {
+          best = r.score
+          bx = ox
+          by = oy
+          bestOverlap = r.n
+        }
       }
     }
   }
@@ -146,6 +192,15 @@ export function refineOffset(
 }
 
 const acc = new Float64Array(NB * 6)
+
+/** The first look at the search window uses every this-many-th of the samples the proper look uses... */
+const SCOUT_THIN = 4
+/** ...and this many of its best offsets get the proper look, each with the offsets up to this far around it. */
+const SCOUT_KEEP = 4
+const SCOUT_REACH = 2
+const scoutScore = new Float64Array(SCOUT_KEEP)
+const scoutAt = new Int32Array(SCOUT_KEEP)
+let visited = new Uint8Array(0)
 
 /**
  * ZNCC computed separately in each screen block, then averaged (weighted by sample
