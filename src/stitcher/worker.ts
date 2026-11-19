@@ -22,7 +22,6 @@ const PREVIEW_SCALE = 4
 const PREVIEW_SIZE = TILE_SIZE / PREVIEW_SCALE
 const PREVIEW_INTERVAL_MS = 200
 const MASK_INTERVAL_MS = 500
-/** Status updates (each one re-renders the UI) are sent at most this often, unless the state changes. */
 const STATUS_INTERVAL_MS = 100
 
 const stitcher = new Stitcher(DEFAULT_SETTINGS)
@@ -189,7 +188,6 @@ function stitchFrame(read: ReadFrame, refetchKey?: number): void {
   const now = performance.now()
   frameTimes.push(now)
   while (frameTimes.length > 0 && now - frameTimes[0] > 1000) frameTimes.shift()
-  // Throttled: the UI can't show more than a few updates a second, and every one costs a re-render.
   if (status.state !== lastStatusState || now - lastStatusPost >= STATUS_INTERVAL_MS) {
     lastStatusState = status.state
     lastStatusPost = now
