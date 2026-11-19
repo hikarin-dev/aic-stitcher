@@ -9,7 +9,7 @@
 import { CONF_SIZE, TILE_SIZE, type Tile } from './mosaic'
 import type { TilePreview, WorkerRequest, WorkerResponse, WorldRect } from './protocol'
 import { DEFAULT_KEYFRAME_BYTES } from './stills'
-import { DEFAULT_SETTINGS, Stitcher, type StillImage } from './stitcher'
+import { DEFAULT_SETTINGS, Stitcher, type FrameStatus, type StillImage } from './stitcher'
 
 interface WorkerScope {
   postMessage(message: WorkerResponse, transfer?: Transferable[]): void
@@ -22,6 +22,7 @@ const PREVIEW_SCALE = 4
 const PREVIEW_SIZE = TILE_SIZE / PREVIEW_SCALE
 const PREVIEW_INTERVAL_MS = 200
 const MASK_INTERVAL_MS = 500
+const STATUS_INTERVAL_MS = 100
 
 const stitcher = new Stitcher(DEFAULT_SETTINGS)
 /**
@@ -61,9 +62,23 @@ let reader: ReadableStreamDefaultReader<VideoFrame> | null = null
 let lastPreview = 0
 /** How long the last preview update took (ms). */
 let previewCost = 0
+let lastStatusPost = 0
+let lastStatusState: FrameStatus['state'] | null = null
+/** The newest status that the throttle held back; it goes out when the stream ends or capture stops. */
+let pendingStatus: { status: FrameStatus; fps: number } | null = null
 let lastMaskPost = 0
 let postedMaskVersion = -1
 const frameTimes: number[] = []
+
+/** Sends the status the throttle held back, if any, so the UI doesn't keep showing old numbers. */
+function flushStatus(): void {
+  if (!pendingStatus) return
+  const { status, fps } = pendingStatus
+  pendingStatus = null
+  lastStatusState = status.state
+  lastStatusPost = performance.now()
+  post({ type: 'status', status, fps })
+}
 
 /** The size a source of `width`×`height` is processed at. */
 function processingSize(width: number, height: number): { w: number; h: number } {
@@ -185,7 +200,14 @@ function stitchFrame(read: ReadFrame, refetchKey?: number): void {
   const now = performance.now()
   frameTimes.push(now)
   while (frameTimes.length > 0 && now - frameTimes[0] > 1000) frameTimes.shift()
-  post({ type: 'status', status, fps: frameTimes.length })
+  if (status.state !== lastStatusState || now - lastStatusPost >= STATUS_INTERVAL_MS) {
+    lastStatusState = status.state
+    lastStatusPost = now
+    pendingStatus = null
+    post({ type: 'status', status, fps: frameTimes.length })
+  } else {
+    pendingStatus = { status, fps: frameTimes.length }
+  }
 
   // (Never more than about a fifth of the time goes into showing the map.)
   if (now - lastPreview > Math.max(PREVIEW_INTERVAL_MS, 4 * previewCost)) {
@@ -203,6 +225,8 @@ function stitchFrame(read: ReadFrame, refetchKey?: number): void {
 /** Everything the UI shows about the map, after an operation that was not a frame. */
 function postMapState(): void {
   postTiles(stitcher.mosaic.takeDirty())
+  // The status sent here is fresh, so a held-back one is out of date.
+  pendingStatus = null
   const status = stitcher.idleStatus()
   if (status) post({ type: 'status', status, fps: 0 })
 }
@@ -366,6 +390,7 @@ async function pump(stream: ReadableStream<VideoFrame>): Promise<void> {
   } finally {
     if (reader === own) {
       reader = null
+      flushStatus()
       postTiles(stitcher.mosaic.takeDirty())
       post({ type: 'stream-ended' })
     }
@@ -500,6 +525,7 @@ scope.onmessage = (event) => {
       r?.cancel().catch(() => {})
       // A recording that was being read is closed now: its frames can't be had again.
       stitcher.forgetSource()
+      flushStatus()
       postTiles(stitcher.mosaic.takeDirty())
       break
     }
